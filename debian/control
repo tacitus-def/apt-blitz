@@ -1,0 +1,24 @@
+Source: apt-blitz
+Section: net
+Priority: optional
+Maintainer: Petr Sleptsov <spetr@bk.ru>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.7.0
+Homepage: https://github.com/tacitus-def/apt-blitz
+Rules-Requires-Root: no
+
+Package: apt-blitz
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: APT proxy with multithreaded downloading via Range requests
+ apt-blitz is an HTTP forward proxy designed for APT.
+ It accelerates package downloads by splitting files into segments
+ and downloading them concurrently using HTTP Range requests.
+ .
+ Features:
+  - Multithreaded downloads via HTTP Range requests
+  - SQLite-based disk cache with LRU eviction
+  - In-flight request coalescing (deduplication)
+  - FTP support
+  - CONNECT tunnel for HTTPS
+  - YAML configuration with URL mapping and upstream proxy support

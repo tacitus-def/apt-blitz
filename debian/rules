@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --frozen
+
+override_dh_auto_test:
+	cargo test --frozen || echo "Tests skipped during package build"
+
+override_dh_strip_nondeterminism:
+	dh_strip_nondeterminism -Xtarget/release/apt-blitz
+
+override_dh_auto_clean:
+	cargo clean

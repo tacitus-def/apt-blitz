@@ -1,0 +1,19 @@
+[Unit]
+Description=APT proxy with multithreaded downloading
+Documentation=https://github.com/tacitus-def/apt-blitz
+After=network.target
+
+[Service]
+Type=simple
+User=apt-blitz
+Group=apt-blitz
+EnvironmentFile=-/etc/default/apt-blitz
+ExecStart=/usr/bin/apt-blitz $ARGS
+CacheDirectory=apt-blitz
+CacheDirectoryMode=0750
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

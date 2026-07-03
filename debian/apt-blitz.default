@@ -1,0 +1,4 @@
+# Default arguments for apt-blitz.
+# Uncomment and adjust as needed.
+# ARGS="--port 8080 --cache-dir /var/cache/apt-blitz"
+ARGS=""
