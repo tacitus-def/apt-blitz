@@ -196,8 +196,21 @@ The resulting `.deb` package is placed in the parent directory.
 ### RPM (Fedora / RHEL)
 
 ```bash
-cargo build --release
-rpmbuild -ba rpm/apt-blitz.spec
+# Создать source-архив
+git archive --format=tar.gz -o rpm/apt-blitz-0.1.0.tar.gz \
+  --prefix=apt-blitz-0.1.0/ HEAD
+
+# Собрать RPM (--nodeps нужен, если Rust установлен через rustup)
+rpmbuild -ba rpm/apt-blitz.spec \
+  --nodeps \
+  --define "_sourcedir $(pwd)/rpm" \
+  --define "_specdir $(pwd)/rpm" \
+  --define "_builddir $(pwd)/rpm/build" \
+  --define "_buildrootdir $(pwd)/rpm/buildroot" \
+  --define "_rpmdir $(pwd)/rpm" \
+  --define "_srcrpmdir $(pwd)/rpm"
+
+# Результат: rpm/RPMS/x86_64/apt-blitz-0.1.0-1.x86_64.rpm
 ```
 
 ### Docker

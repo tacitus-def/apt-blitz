@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
@@ -92,16 +92,35 @@ impl From<reqwest::Error> for ProxyError {
 
 pub async fn handle_proxy(
     method: Method,
-    Path(original_url): Path<String>,
     State(state): State<AppState>,
+    req: Request,
 ) -> Result<Response, ProxyError> {
-    info!(url = %original_url, "request");
+    let uri_str = req.uri().to_string();
+    let original_url = uri_str.strip_prefix('/').unwrap_or(&uri_str).to_string();
+    let url = if original_url.contains("://") {
+        original_url
+    } else {
+        // origin-form — извлекаем хост из Host-заголовка
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| {
+                ProxyError::BadRequest(
+                    "absolute URI or Host header required".into(),
+                )
+            })?;
+        format!("http://{}/{}", host, original_url)
+    };
+    info!(url = %url, "request");
 
-    // Resolve fake‑host → real upstream (for caching HTTPS content)
-    let url = resolve_url(&original_url, &state.config.url_maps);
-    if url != original_url {
-        info!(fake = %original_url, upstream = %url, "url mapped");
-    }
+    let url = {
+        let mapped = resolve_url(&url, &state.config.url_maps);
+        if mapped != url {
+            info!(original = %url, upstream = %mapped, "url mapped");
+        }
+        mapped
+    };
 
     if method == Method::HEAD {
         info!(url = %url, "HEAD request, forwarding without body");
@@ -117,12 +136,6 @@ pub async fn handle_proxy(
 
     if url.starts_with("ftp://") || url.starts_with("ftps://") {
         return handle_ftp_proxy(&url, &state).await;
-    }
-
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(ProxyError::BadRequest(format!(
-            "unsupported scheme in URL (original: {original_url}, resolved: {url})"
-        )));
     }
 
     let mut retries = 0u32;
