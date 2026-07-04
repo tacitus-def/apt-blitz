@@ -22,7 +22,7 @@ use reqwest::Client;
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
 use tower_service::Service;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::cache::Cache;
 use crate::coalescer::Coalescer;
@@ -167,6 +167,6 @@ async fn handle_connection(
         .serve_connection(io, svc)
         .await
     {
-        warn!("HTTP connection error: {err}");
+        debug!("HTTP connection error: {err}");
     }
 }

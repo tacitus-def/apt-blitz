@@ -266,57 +266,9 @@ pub async fn handle_proxy(
                 }
             }
             Ok(Err(e)) => {
-                error!(url = %cache_url, error = ?e, "multithreaded download failed, falling back to plain proxy");
-                match cache_state.client.get(&cache_url).send().await {
-                    Ok(resp) => {
-                        let fb_headers = resp.headers().clone();
-                        let mut stream = resp.bytes_stream();
-                        let mut offset = 0u64;
-                        let mut ok = true;
-                        while let Some(chunk) = stream.next().await {
-                            match chunk {
-                                Ok(data) => {
-                                    if let Err(e) = cache_buffer.write_data(offset, &data) {
-                                        error!(error = %e, "fallback: write failed");
-                                        ok = false;
-                                        break;
-                                    }
-                                    offset += data.len() as u64;
-                                }
-                                Err(e) => {
-                                    error!(error = ?e, "fallback: stream error");
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if ok {
-                            cache_buffer.mark_all_ready();
-                            info!(url = %cache_url, "fallback complete, storing to cache");
-                            let sync_buf = cache_buffer.clone();
-                            if tokio::task::spawn_blocking(move || sync_buf.sync())
-                                .await
-                                .is_ok_and(|r| r.is_ok())
-                            {
-                                if let Err(e) = cache_state.cache.store(&cache_url, cache_buffer.file_path(), &fb_headers).await {
-                                    error!(error = %e, "fallback: cache store failed");
-                                    let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                                }
-                            } else {
-                                error!("fallback: sync failed, removing temp file");
-                                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                            }
-                        } else {
-                            error!("fallback: stream aborted, removing temp file");
-                            cache_buffer.set_failed();
-                            let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = ?e, "fallback plain proxy failed");
-                        cache_buffer.set_failed();
-                    }
-                }
+                error!(url = %cache_url, error = ?e, "multithreaded download failed, cleaning up");
+                cache_buffer.set_failed();
+                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
             }
             Err(e) => {
                 error!(url = %cache_url, error = ?e, "download task panicked, cleaning up temp");
