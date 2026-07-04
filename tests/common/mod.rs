@@ -220,7 +220,6 @@ impl TestContext {
             port: 0,
             bind: "127.0.0.1".into(),
             connections: 4,
-            min_speed: 51200,
             cache_dir: cache_dir.path().join("cache"),
             max_cache_size,
             url_maps: vec![],

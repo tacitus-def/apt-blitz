@@ -19,8 +19,6 @@ use crate::config::{Config, ProxyType, UrlMap};
 use crate::downloader::download_multithreaded;
 use crate::ftp;
 
-// 3 × MSS (3 × 8192) — читает 24 KiB за раз, чтобы не фрагментировать TCP-сегмент при throttle
-const CHUNK_SIZE: u64 = 32 * 768;
 fn can_multithread(content_length: Option<u64>, accept_ranges: Option<&http::HeaderValue>) -> bool {
     content_length.is_some() && accept_ranges == Some(&http::HeaderValue::from_static("bytes"))
 }
@@ -160,11 +158,11 @@ pub async fn handle_proxy(
                         continue;
                     }
                 };
-                return Ok(serve_from_buffer(buffer, &state, &url).await);
+                return Ok(serve_from_buffer(buffer, &url).await);
             }
             RegisterResult::FollowerBuffer(buffer) => {
                 info!(url = %url, "joining completed in-flight download");
-                return Ok(serve_from_buffer(buffer, &state, &url).await);
+                return Ok(serve_from_buffer(buffer, &url).await);
             }
             RegisterResult::Leader => {
                 info!(url = %url, "becoming download leader");
@@ -329,7 +327,7 @@ pub async fn handle_proxy(
         cache_state.coalescer.complete(&cache_url);
     });
 
-    let stream = make_buffer_stream(buffer, notify_rx, state.config.min_speed, &url);
+    let stream = make_buffer_stream(buffer, notify_rx, &url);
     let mut resp_builder = Response::builder().status(resp_status);
     for (key, val) in &resp_headers {
         resp_builder = resp_builder.header(key, val);
@@ -364,11 +362,11 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
                         continue;
                     }
                 };
-                return Ok(serve_from_buffer(buffer, state, url).await);
+                return Ok(serve_from_buffer(buffer, url).await);
             }
             RegisterResult::FollowerBuffer(buffer) => {
                 info!(url = %url, "joining completed in-flight FTP download");
-                return Ok(serve_from_buffer(buffer, state, url).await);
+                return Ok(serve_from_buffer(buffer, url).await);
             }
             RegisterResult::Leader => {
                 info!(url = %url, "becoming FTP download leader");
@@ -451,7 +449,7 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
         cache_state.coalescer.complete(&cache_url);
     });
 
-    let stream = make_buffer_stream(buffer, notify_rx, state.config.min_speed, url);
+    let stream = make_buffer_stream(buffer, notify_rx, url);
     let mut resp_builder = Response::builder().status(resp_status);
     for (key, val) in &resp_headers {
         resp_builder = resp_builder.header(key, val);
@@ -460,10 +458,10 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
     Ok(resp)
 }
 
-async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, state: &AppState, url: &str) -> Response {
+async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, url: &str) -> Response {
     let meta = buffer.wait_meta().await;
     let rx = buffer.subscribe();
-    let stream = make_buffer_stream(buffer, rx, state.config.min_speed, url);
+    let stream = make_buffer_stream(buffer, rx, url);
     let mut resp_builder = Response::builder().status(meta.0);
     for (key, val) in &meta.1 {
         resp_builder = resp_builder.header(key, val);
@@ -474,7 +472,6 @@ async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, state: &AppState, url: &
 fn make_buffer_stream(
     buffer: Arc<SegmentsBuffer>,
     notify_rx: broadcast::Receiver<usize>,
-    min_speed: u64,
     url: &str,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     let url = url.to_string();
@@ -484,9 +481,6 @@ fn make_buffer_stream(
         url: String,
         current_segment: usize,
         offset_in_segment: u64,
-        throttled: bool,
-        min_speed: u64,
-        last_yield: tokio::time::Instant,
         errored: bool,
     }
 
@@ -496,9 +490,6 @@ fn make_buffer_stream(
         url,
         current_segment: 0,
         offset_in_segment: 0,
-        throttled: true,
-        min_speed,
-        last_yield: tokio::time::Instant::now(),
         errored: false,
     };
 
@@ -516,11 +507,6 @@ fn make_buffer_stream(
                     )),
                     state,
                 ));
-            }
-
-            if state.throttled && state.buffer.all_completed() {
-                info!(url = %state.url, "all segments ready, removing throttle");
-                state.throttled = false;
             }
 
             if state.current_segment >= state.buffer.num_segments() {
@@ -555,30 +541,15 @@ fn make_buffer_stream(
             }
 
             let remaining = seg_end - seg_pos;
-            let chunk_size = if state.throttled {
-                CHUNK_SIZE.min(remaining)
-            } else {
-                remaining
-            };
-
-            if state.throttled && chunk_size > 0 {
-                let elapsed = state.last_yield.elapsed();
-                let expected =
-                    Duration::from_secs_f64(chunk_size as f64 / state.min_speed as f64);
-                if elapsed < expected {
-                    tokio::time::sleep(expected - elapsed).await;
-                }
-            }
 
             let data = state
                 .buffer
-                .read_data(seg_pos, chunk_size);
+                .read_data(seg_pos, remaining);
 
             match data {
                 Some(bytes) if !bytes.is_empty() => {
                     let len = bytes.len() as u64;
                     state.offset_in_segment += len;
-                    state.last_yield = tokio::time::Instant::now();
                     return Some((Ok(bytes), state));
                 }
                 _ => {
@@ -655,11 +626,6 @@ mod tests {
         let req_err = result.unwrap_err();
         let err: ProxyError = req_err.into();
         assert!(matches!(err, ProxyError::Upstream(_)));
-    }
-
-    #[test]
-    fn test_constants_sanity() {
-        assert_eq!(CHUNK_SIZE, 32 * 768);
     }
 
     #[test]
@@ -1077,7 +1043,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, 51200, "http://test/x");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/x");
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1129,7 +1095,7 @@ mod tests {
         buffer.mark_ready(id2);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, 51200, "http://test/y");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/y");
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1145,7 +1111,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_make_buffer_stream_backpressure_mid_segment() {
+    async fn test_make_buffer_stream_mid_segment() {
         let dir = std::env::temp_dir().join("apt-blitz-test-make-buffer-stream");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test-backpressure.dat");
@@ -1155,7 +1121,6 @@ mod tests {
             .open(&file_path)
             .unwrap();
 
-        // Larger than CHUNK_SIZE so mid-segment backpressure is exercised
         let total_size = 50_000;
         file.set_len(total_size).unwrap();
 
@@ -1168,7 +1133,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, 51200, "http://test/z");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/z");
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1204,7 +1169,7 @@ mod tests {
         buffer.set_failed();
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, 51200, "http://test/fail");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/fail");
         let result: Vec<_> = futures_util::StreamExt::collect::<Vec<_>>(stream).await;
 
         assert_eq!(result.len(), 1);

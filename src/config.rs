@@ -99,7 +99,6 @@ pub struct Config {
     pub port: u16,
     pub bind: String,
     pub connections: usize,
-    pub min_speed: u64,
     pub cache_dir: PathBuf,
     pub max_cache_size: u64,
     pub url_maps: Vec<UrlMap>,
@@ -113,7 +112,6 @@ struct YamlConfig {
     port: Option<u16>,
     bind: Option<String>,
     connections: Option<usize>,
-    min_speed: Option<u64>,
     cache_dir: Option<PathBuf>,
     max_cache_size: Option<u64>,
     url_map: Option<Vec<String>>,
@@ -135,9 +133,6 @@ struct Cli {
 
     #[arg(long, default_value_t = 4, env = "PROXY_CONNECTIONS")]
     connections: usize,
-
-    #[arg(long, default_value_t = 51_200, env = "PROXY_MIN_SPEED")]
-    min_speed: u64,
 
     #[arg(long, default_value = "/var/cache/apt-blitz", env = "PROXY_CACHE_DIR")]
     cache_dir: PathBuf,
@@ -207,7 +202,6 @@ impl Config {
             port: cli.port,
             bind: cli.bind,
             connections: cli.connections,
-            min_speed: cli.min_speed,
             cache_dir: cli.cache_dir,
             max_cache_size: cli.max_cache_size,
             url_maps,
@@ -272,7 +266,6 @@ impl YamlConfig {
         set!("PORT", self.port);
         set!("BIND", self.bind.as_ref());
         set!("CONNECTIONS", self.connections);
-        set!("MIN_SPEED", self.min_speed);
         set!("CACHE_DIR", self.cache_dir.as_ref().map(|p| p.to_string_lossy().to_string()));
         set!("MAX_CACHE_SIZE", self.max_cache_size);
 
@@ -301,11 +294,10 @@ impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Config {{ port: {}, bind: {}, connections: {}, min_speed: {}, cache_dir: {}, max_cache_size: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {} }}",
+            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {} }}",
             self.port,
             self.bind,
             self.connections,
-            self.min_speed,
             self.cache_dir.display(),
             self.max_cache_size,
             self.url_maps.len(),
@@ -501,7 +493,6 @@ no_proxy:
             port: 8080,
             bind: "0.0.0.0".into(),
             connections: 4,
-            min_speed: 51200,
             cache_dir: PathBuf::from("/tmp/cache"),
             max_cache_size: 1024,
             url_maps: vec![UrlMap::parse("a=http://a.com").unwrap()],
@@ -563,7 +554,6 @@ no_proxy:
             port: 8080,
             bind: "0.0.0.0".into(),
             connections: 4,
-            min_speed: 51200,
             cache_dir: PathBuf::from("/var/cache/apt-blitz"),
             max_cache_size: 1_073_741_824,
             url_maps: vec![],
@@ -592,7 +582,6 @@ no_proxy:
             port: Some(8080),
             bind: Some("127.0.0.1".into()),
             connections: None,
-            min_speed: None,
             cache_dir: None,
             max_cache_size: None,
             url_map: None,

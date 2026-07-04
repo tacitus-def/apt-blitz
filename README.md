@@ -11,7 +11,6 @@ Inspired by `apt-cacher-ng` and `aria2` — combines request coalescing, range-b
 - **FTP support** — Proxies FTP URLs (`ftp://`), single-threaded and multithreaded (`PASV` + `REST`). Anonymous or password-authenticated.
 - **CONNECT tunnel** — Handles `CONNECT` for HTTPS, SOCKS5, and arbitrary TCP tunnels. Supports upstream HTTP/SOCKS5 proxy chaining and `NO_PROXY` bypass.
 - **SQLite disk cache** — WAL mode, LRU eviction by `last_access`. Stores response headers alongside cached files.
-- **Bandwidth throttling** — Per-request minimum speed guarantee; disables automatically when all segments are ready.
 - **Plain proxy fallback** — Falls back to single-stream proxy for files without `Accept-Ranges: bytes`, or when multithreaded download fails.
 - **URL mapping** — Map fake hosts to real upstream URLs to cache HTTPS content through the proxy.
 - **Upstream proxy chain** — Route through another HTTP, HTTPS, or SOCKS5 proxy with optional authentication.
@@ -52,7 +51,6 @@ All options can be set via CLI flags or environment variables. A YAML config fil
 | `--port` | `PROXY_PORT` | `8080` | Listen port |
 | `--bind` | `PROXY_BIND` | `0.0.0.0` | Bind address |
 | `--connections` | `PROXY_CONNECTIONS` | `4` | Parallel connections per download |
-| `--min-speed` | `PROXY_MIN_SPEED` | `51200` | Minimum throttle speed (bytes/s) |
 | `--cache-dir` | `PROXY_CACHE_DIR` | `/var/cache/apt-blitz` | Cache directory |
 | `--max-cache-size` | `PROXY_MAX_CACHE_SIZE` | `1073741824` (1 GiB) | Maximum cache size |
 | `--url-map` | `PROXY_URL_MAP` | — | Fake-host to real-base mapping (`fake-apt=https://real.example.com`), repeatable or comma-separated |
@@ -73,7 +71,6 @@ PROXY_PORT=3128 PROXY_CACHE_DIR=/tmp/cache PROXY_UPSTREAM_PROXY=socks5://10.0.0.
 port: 8080
 bind: "0.0.0.0"
 connections: 8
-min_speed: 102400
 cache_dir: "/var/cache/apt-blitz"
 max_cache_size: 4294967296
 url_map:

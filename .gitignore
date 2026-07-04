@@ -3,3 +3,7 @@
 *.swo
 *~
 .DS_Store
+rpm/build/
+rpm/x86_64/
+rpm/*.src.rpm
+rpm/*.tar.gz

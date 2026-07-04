@@ -57,7 +57,6 @@ async fn origin_form_single_file() {
         port: 0,
         bind: "127.0.0.1".into(),
         connections: 4,
-        min_speed: 51200,
         cache_dir: cache_dir.path().join("cache"),
         max_cache_size: 1024 * 1024 * 1024,
         url_maps: vec![],
@@ -159,7 +158,6 @@ async fn origin_form_with_url_map() {
         port: 0,
         bind: "127.0.0.1".into(),
         connections: 4,
-        min_speed: 51200,
         cache_dir: cache_dir.path().join("cache"),
         max_cache_size: 1024 * 1024 * 1024,
         // UrlMap: fake-host → реальный upstream
