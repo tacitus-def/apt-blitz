@@ -1,0 +1,175 @@
+.\" Man page for apt-blitz
+.\" Generated from source; do not edit manually.
+.\"
+.TH APT-BLITZ 1 "2026-07-04" "0.1.2" "User Commands"
+.SH NAME
+apt-blitz \- multithreaded proxy for APT-like package managers
+.SH SYNOPSIS
+.B apt-blitz
+[\fI\,OPTIONS\/\fR]
+.SH DESCRIPTION
+\fBapt-blitz\fR is an HTTP forward proxy designed for APT-based Linux
+distributions.  It speeds up package downloads by splitting files into
+segments and fetching them concurrently, caching results in SQLite-backed
+storage with LRU eviction.
+.P
+Key features:
+.IP \(bu 3
+Multithreaded download with adaptive segment sizing
+.IP \(bu 3
+Transparent caching via SQLite with WAL mode
+.IP \(bu 3
+FTP and FTPS protocol support
+.IP \(bu 3
+In-flight request coalescing (deduplication)
+.IP \(bu 3
+YAML configuration file support
+.IP \(bu 3
+Upstream proxy chaining (HTTP, HTTPS, SOCKS5)
+.IP \(bu 3
+URL mapping (fake host to real base URL)
+.SH OPTIONS
+.TP
+.B \-\-port \fI\,PORT\/\fR
+TCP port to listen on.
+.br
+Default: \fB8080\fR
+.br
+Env: \fBPROXY_PORT\fR
+.TP
+.B \-\-bind \fI\,ADDRESS\/\fR
+IP address to bind to.
+.br
+Default: \fB127.0.0.1\fR
+.br
+Env: \fBPROXY_BIND\fR
+.TP
+.B \-\-connections \fI\,COUNT\/\fR
+Maximum concurrent connections (used by the multithreaded downloader).
+.br
+Default: \fB4\fR
+.br
+Env: \fBPROXY_CONNECTIONS\fR
+.TP
+.B \-\-cache\-dir \fI\,PATH\/\fR
+Directory for the SQLite cache database and temporary files.
+.br
+Default: \fB/var/cache/apt-blitz\fR
+.br
+Env: \fBPROXY_CACHE_DIR\fR
+.TP
+.B \-\-max\-cache\-size \fI\,BYTES\/\fR
+Maximum cache size in bytes (LRU eviction).
+.br
+Default: \fB1073741824\fR (1 GiB)
+.br
+Env: \fBPROXY_MAX_CACHE_SIZE\fR
+.TP
+.B \-\-config\-file \fI\,PATH\/\fR
+Explicit path to the YAML configuration file.
+When unset, auto-discovery is used (see FILES section).
+.br
+Env: \fBPROXY_CONFIG_FILE\fR
+.TP
+.B \-\-url\-map \fI\,FAKE=REAL\/\fR
+Map a fake host to a real base URL.  Multiple mappings
+can be specified by repeating the flag or by separating
+with commas in the environment variable.
+.br
+Supported URL schemes: \fBhttp://\fR, \fBhttps://\fR,
+\fBftp://\fR, \fBftps://\fR.
+.br
+Env: \fBPROXY_URL_MAP\fR
+.TP
+.B \-\-upstream\-proxy \fI\,URL\/\fR
+Route all outgoing requests through an upstream proxy.
+.br
+Supported schemes: \fBhttp://\fR, \fBhttps://\fR,
+\fBsocks5://\fR.
+.br
+Example: \fBhttp://10.0.0.1:3128\fR
+.br
+Env: \fBPROXY_UPSTREAM_PROXY\fR
+.TP
+.B \-\-no\-proxy \fI\,HOSTS\/\fR
+Comma-separated list of hosts that bypass the upstream proxy.
+Accepts domain suffixes (e.g. \fB.local\fR) and CIDR subnets.
+.br
+Env: \fBPROXY_NO_PROXY\fR
+.TP
+.B \-h, \-\-help
+Print help message and exit.
+.TP
+.B \-V, \-\-version
+Print version information and exit.
+.SH ENVIRONMENT
+The following environment variables override both the YAML config file
+and built-in defaults.  CLI flags take precedence over all.
+.TP
+.B PROXY_PORT
+Equivalent to \fB\-\-port\fR.
+.TP
+.B PROXY_BIND
+Equivalent to \fB\-\-bind\fR.
+.TP
+.B PROXY_CONNECTIONS
+Equivalent to \fB\-\-connections\fR.
+.TP
+.B PROXY_CACHE_DIR
+Equivalent to \fB\-\-cache\-dir\fR.
+.TP
+.B PROXY_MAX_CACHE_SIZE
+Equivalent to \fB\-\-max\-cache\-size\fR.
+.TP
+.B PROXY_CONFIG_FILE
+Equivalent to \fB\-\-config\-file\fR.
+.TP
+.B PROXY_URL_MAP
+Equivalent to \fB\-\-url\-map\fR (comma-separated).
+.TP
+.B PROXY_UPSTREAM_PROXY
+Equivalent to \fB\-\-upstream\-proxy\fR.
+.TP
+.B PROXY_NO_PROXY
+Equivalent to \fB\-\-no\-proxy\fR (comma-separated).
+.SH FILES
+.TP
+.I apt-blitz.yaml, apt-blitz.yml
+Configuration file in the current working directory.
+.TP
+.I ~/.config/apt-blitz/config.yaml, ~/.config/apt-blitz/config.yml
+Per-user configuration file.
+.TP
+.I /etc/apt-blitz/config.yaml, /etc/apt-blitz/config.yml
+System-wide configuration file.
+.P
+Configuration is loaded from the first file found in the order listed
+above, unless \fB\-\-config\-file\fR is explicitly provided.
+.SH EXAMPLE CONFIGURATION
+.nf
+.RS
+# apt-blitz.yaml
+port: 8080
+bind: "127.0.0.1"
+connections: 8
+cache_dir: "/var/cache/apt-blitz"
+max_cache_size: 5368709120
+url_map:
+  \- fake-debian=https://deb.debian.org
+upstream_proxy: "http://10.0.0.1:3128"
+no_proxy:
+  \- .local
+  \- 10.0.0.0/8
+.RE
+.fi
+.SH AUTHORS
+Written by tacitus-def.
+.br
+See the GitHub repository for contributors:
+.UR https://github.com/tacitus-def/apt-blitz
+.UE
+.SH COPYRIGHT
+Copyright \(co 2026 tacitus-def.  License: MIT.
+.SH SEE ALSO
+.UR https://github.com/tacitus-def/apt-blitz
+.UE

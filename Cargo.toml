@@ -1,7 +1,12 @@
 [package]
 name = "apt-blitz"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
+
+[[man]]
+name = "apt-blitz"
+section = 1
+source = "man/apt-blitz.1"
 
 [dependencies]
 axum = "0.8"
