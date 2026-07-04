@@ -128,7 +128,7 @@ struct Cli {
     #[arg(long, default_value = "8080", env = "PROXY_PORT")]
     port: u16,
 
-    #[arg(long, default_value = "0.0.0.0", env = "PROXY_BIND")]
+    #[arg(long, default_value = "127.0.0.1", env = "PROXY_BIND")]
     bind: String,
 
     #[arg(long, default_value_t = 4, env = "PROXY_CONNECTIONS")]
@@ -491,7 +491,7 @@ no_proxy:
     fn test_config_debug() {
         let cfg = Config {
             port: 8080,
-            bind: "0.0.0.0".into(),
+            bind: "127.0.0.1".into(),
             connections: 4,
             cache_dir: PathBuf::from("/tmp/cache"),
             max_cache_size: 1024,
@@ -552,7 +552,7 @@ no_proxy:
     fn test_config_display_contain_fields() {
         let cfg = Config {
             port: 8080,
-            bind: "0.0.0.0".into(),
+            bind: "127.0.0.1".into(),
             connections: 4,
             cache_dir: PathBuf::from("/var/cache/apt-blitz"),
             max_cache_size: 1_073_741_824,
@@ -562,7 +562,7 @@ no_proxy:
         };
         let output = cfg.to_string();
         assert!(output.contains("port: 8080"));
-        assert!(output.contains("bind: 0.0.0.0"));
+        assert!(output.contains("bind: 127.0.0.1"));
         assert!(output.contains("url_maps: 0"));
     }
 
