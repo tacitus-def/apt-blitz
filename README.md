@@ -71,7 +71,7 @@ All options can be set via CLI flags or environment variables. A YAML config fil
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
-| `--max-connections-per-ip` | `PROXY_MAX_CONNECTIONS_PER_IP` | `4` | Max concurrent downloads per client IP |
+| `--max-connections-per-ip` | `PROXY_MAX_CONNECTIONS_PER_IP` | `0` | Max concurrent downloads per client IP (0 = unlimited) |
 | `--max-total-connections` | `PROXY_MAX_TOTAL_CONNECTIONS` | `0` | Max total concurrent connections across all IPs |
 | `--max-workers` | `PROXY_MAX_WORKERS` | `0` | Max worker threads across all concurrent downloads |
 
@@ -97,7 +97,7 @@ upstream_proxy: "http://10.0.0.1:3128"
 no_proxy:
   - ".local"
   - "10.0.0.0/8"
-max_connections_per_ip: 4
+max_connections_per_ip: 0
 max_total_connections: 0
 max_workers: 0
 upstream_bandwidth: 50M

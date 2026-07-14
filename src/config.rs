@@ -260,7 +260,7 @@ struct Cli {
     no_proxy: Vec<String>,
 
     /// Max in-flight downloads per client IP (0 = unlimited)
-    #[arg(long, default_value_t = 4, env = "PROXY_MAX_CONNECTIONS_PER_IP")]
+    #[arg(long, default_value_t = 0, env = "PROXY_MAX_CONNECTIONS_PER_IP")]
     max_connections_per_ip: usize,
 
     /// Max total concurrent connections across all IPs (0 = unlimited)

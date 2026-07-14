@@ -109,7 +109,7 @@ Env: \fBPROXY_NO_PROXY\fR
 Maximum concurrent downloads per client IP.
 Set to \fB0\fR for unlimited.
 .br
-Default: \fB4\fR
+Default: \fB0\fR
 .br
 Env: \fBPROXY_MAX_CONNECTIONS_PER_IP\fR
 .TP
@@ -237,7 +237,7 @@ upstream_proxy: "http://10.0.0.1:3128"
 no_proxy:
   \- .local
   \- 10.0.0.0/8
-max_connections_per_ip: 4
+max_connections_per_ip: 0
 max_total_connections: 0
 max_workers: 0
 upstream_bandwidth: 50M
