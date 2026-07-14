@@ -54,13 +54,13 @@ All options can be set via CLI flags or environment variables. A YAML config fil
 | `--bind` | `PROXY_BIND` | `127.0.0.1` | Bind address |
 | `--connections` | `PROXY_CONNECTIONS` | `4` | Parallel connections per download |
 | `--cache-dir` | `PROXY_CACHE_DIR` | `/var/cache/apt-blitz` | Cache directory |
-| `--max-cache-size` | `PROXY_MAX_CACHE_SIZE` | `1073741824` (1 GiB) | Maximum cache size |
+| `--max-cache-size` | `PROXY_MAX_CACHE_SIZE` | `1073741824` (1 GiB) | Maximum cache size (supports `K`/`M`/`G`/`T`/`P` suffixes) |
 | `--url-map` | `PROXY_URL_MAP` | — | Fake-host to real-base mapping (`fake-apt=https://real.example.com`), repeatable or comma-separated |
 | `--upstream-proxy` | `PROXY_UPSTREAM_PROXY` | — | Upstream proxy URL (`http://proxy:3128`, `socks5://host:1080`) |
 | `--no-proxy` | `PROXY_NO_PROXY` | — | Bypass upstream proxy for these hosts (supports `*`, suffix `.local`, CIDR) |
 | `--config-file` | `PROXY_CONFIG_FILE` | — | Explicit YAML config path |
 
-**Bandwidth limiting** (bytes/sec, 0 = unlimited):
+**Bandwidth limiting** (bytes/sec, 0 = unlimited, supports `K`/`M`/`G`/`T`/`P` suffixes):
 
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
@@ -89,7 +89,7 @@ port: 8080
 bind: "127.0.0.1"
 connections: 8
 cache_dir: "/var/cache/apt-blitz"
-max_cache_size: 4294967296
+max_cache_size: 4G
 url_map:
   - "deb=https://deb.debian.org"
   - "sec=https://security.debian.org"
@@ -100,8 +100,8 @@ no_proxy:
 max_connections_per_ip: 4
 max_total_connections: 0
 max_workers: 0
-upstream_bandwidth: 0
-per_ip_bandwidth: 0
+upstream_bandwidth: 50M
+per_ip_bandwidth: 10M
 ```
 
 Auto-discovery locations (in order):

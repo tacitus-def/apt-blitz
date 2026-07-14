@@ -63,7 +63,11 @@ Default: \fB/var/cache/apt-blitz\fR
 Env: \fBPROXY_CACHE_DIR\fR
 .TP
 .B \-\-max\-cache\-size \fI\,BYTES\/\fR
-Maximum cache size in bytes (LRU eviction).
+Maximum cache size (LRU eviction).
+Supports binary suffixes: \fBK\fR (1024), \fBM\fR (1024²),
+\fBG\fR (1024³), \fBT\fR (1024⁴), \fBP\fR (1024⁵);
+decimal suffixes: \fBKB\fR, \fBMB\fR, \fBGB\fR, \fBTB\fR, \fBPB\fR.
+Also accepts plain numbers.
 .br
 Default: \fB1073741824\fR (1 GiB)
 .br
@@ -126,7 +130,11 @@ Default: \fB0\fR
 Env: \fBPROXY_MAX_WORKERS\fR
 .TP
 .B \-\-upstream\-bandwidth \fI\,BYTES\/\fR
-Global upstream bandwidth limit in bytes per second.
+Global upstream bandwidth limit (bytes/sec).
+Supports binary suffixes: \fBK\fR (1024), \fBM\fR (1024²),
+\fBG\fR (1024³), \fBT\fR (1024⁴), \fBP\fR (1024⁵);
+decimal suffixes: \fBKB\fR, \fBMB\fR, \fBGB\fR, \fBTB\fR, \fBPB\fR.
+Also accepts plain numbers.
 Applied to all download workers combined.
 When the bucket is empty, workers wait until tokens refill
 before writing the next chunk.
@@ -137,7 +145,11 @@ Default: \fB0\fR
 Env: \fBPROXY_UPSTREAM_BANDWIDTH\fR
 .TP
 .B \-\-per\-ip\-bandwidth \fI\,BYTES\/\fR
-Per\-IP bandwidth limit in bytes per second on the response stream.
+Per\-IP bandwidth limit (bytes/sec) on the response stream.
+Supports binary suffixes: \fBK\fR (1024), \fBM\fR (1024²),
+\fBG\fR (1024³), \fBT\fR (1024⁴), \fBP\fR (1024⁵);
+decimal suffixes: \fBKB\fR, \fBMB\fR, \fBGB\fR, \fBTB\fR, \fBPB\fR.
+Also accepts plain numbers.
 Each client connection has its own token bucket;
 chunks exceeding the bucket are split and delivered
 as tokens become available.
@@ -218,7 +230,7 @@ port: 8080
 bind: "127.0.0.1"
 connections: 8
 cache_dir: "/var/cache/apt-blitz"
-max_cache_size: 5368709120
+max_cache_size: 5G
 url_map:
   \- fake-debian=https://deb.debian.org
 upstream_proxy: "http://10.0.0.1:3128"
@@ -228,8 +240,8 @@ no_proxy:
 max_connections_per_ip: 4
 max_total_connections: 0
 max_workers: 0
-upstream_bandwidth: 0
-per_ip_bandwidth: 0
+upstream_bandwidth: 50M
+per_ip_bandwidth: 10M
 .RE
 .fi
 .SH AUTHORS
