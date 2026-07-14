@@ -86,11 +86,15 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
         cache,
         coalescer: Arc::new(Coalescer::new()),
         temp_dir,
-        ip_limiter: Arc::new(IpRateLimiter::new(
-            config.max_connections_per_ip,
-            config.max_total_connections,
-            config.per_ip_bandwidth,
-        )),
+        ip_limiter: {
+            let limiter = Arc::new(IpRateLimiter::new(
+                config.max_connections_per_ip,
+                config.max_total_connections,
+                config.per_ip_bandwidth,
+            ));
+            limiter.start_sweep();
+            limiter
+        },
         worker_limiter: Arc::new(WorkerLimiter::new(config.max_workers)),
         upstream_bucket: Arc::new(if config.upstream_bandwidth == 0 {
             TokenBucket::unlimited()

@@ -179,11 +179,15 @@ impl AppState {
             cache,
             coalescer: Arc::new(Coalescer::new()),
             temp_dir,
-            ip_limiter: Arc::new(IpRateLimiter::new(
-                config.max_connections_per_ip,
-                config.max_total_connections,
-                config.per_ip_bandwidth,
-            )),
+            ip_limiter: {
+                let limiter = Arc::new(IpRateLimiter::new(
+                    config.max_connections_per_ip,
+                    config.max_total_connections,
+                    config.per_ip_bandwidth,
+                ));
+                limiter.start_sweep();
+                limiter
+            },
             worker_limiter: Arc::new(WorkerLimiter::new(config.max_workers)),
             upstream_bucket: Arc::new(if config.upstream_bandwidth == 0 {
                 TokenBucket::unlimited()
@@ -562,8 +566,9 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
     let dl_buffer = buffer.clone();
     let dl_connections = state.config.connections;
     let dl_worker_limiter = state.worker_limiter.clone();
+    let dl_upstream_bucket = state.upstream_bucket.clone();
     let download_handle = tokio::spawn(async move {
-        ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections, &dl_worker_limiter).await
+        ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections, &dl_worker_limiter, &dl_upstream_bucket).await
     });
 
     spawn_cache_persistence(
@@ -700,16 +705,17 @@ async fn plain_proxy(
     let resp_headers = resp.headers().clone();
 
     let bucket = upstream_bucket.clone();
-    let cancel = tokio_util::sync::CancellationToken::new();
     let stream = resp.bytes_stream().filter_map(move |r| {
         let bucket = bucket.clone();
-        let cancel = cancel.clone();
         async move {
             match r {
                 Ok(chunk) => {
                     let len = chunk.len() as u64;
-                    if !bucket.wait_consume(len, &cancel).await {
-                        return None;
+                    if !bucket.try_consume(len) {
+                        return Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "upstream bandwidth limit exceeded",
+                        )));
                     }
                     Some(Ok(chunk))
                 }

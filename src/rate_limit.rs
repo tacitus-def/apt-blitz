@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -10,6 +10,7 @@ use tracing::warn;
 
 const UNLIMITED: usize = 1_000_000;
 const NANOS_PER_SEC: u64 = 1_000_000_000;
+const MAP_ENTRY_TTL: Duration = Duration::from_secs(600);
 
 fn epoch_nanos() -> u64 {
     SystemTime::now()
@@ -70,19 +71,23 @@ impl TokenBucket {
     /// Try to consume `amount` tokens. Returns true if tokens were available.
     pub fn try_consume(&self, amount: u64) -> bool {
         if self.inner.max_tokens == u64::MAX && self.inner.refill_rate_nanos == 0 {
-            return true; // unlimited bucket
+            return true;
         }
         if self.inner.refill_rate_nanos > 0 {
             self.inner.refill();
         }
-        let prev = self.inner.tokens.load(Ordering::Acquire);
-        if prev >= amount {
-            self.inner
+        loop {
+            let prev = self.inner.tokens.load(Ordering::Acquire);
+            if prev < amount {
+                return false;
+            }
+            if self.inner
                 .tokens
                 .compare_exchange(prev, prev - amount, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
-        } else {
-            false
+            {
+                return true;
+            }
         }
     }
 
@@ -118,14 +123,19 @@ impl TokenBucket {
             return true;
         }
         let mut remaining = bytes;
+        let mut delay_ms = 1u64;
+        let max_delay_ms = 100u64;
         while remaining > 0 {
             if cancel.is_cancelled() {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             let batch = remaining.min(64 * 1024);
             if self.try_consume(batch) {
                 remaining -= batch;
+                delay_ms = 1;
+            } else {
+                delay_ms = (delay_ms * 2).min(max_delay_ms);
             }
         }
         true
@@ -140,21 +150,28 @@ impl TokenBucketInner {
         if elapsed == 0 {
             return;
         }
-        let _ = self.last_refill_nanos.compare_exchange(
-            last,
-            now,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        );
+        if self
+            .last_refill_nanos
+            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
         let refill = (elapsed / self.refill_rate_nanos).min(self.max_tokens);
         if refill == 0 {
             return;
         }
-        let prev = self.tokens.load(Ordering::Acquire);
-        let new = (prev + refill).min(self.max_tokens);
-        let _ = self
-            .tokens
-            .compare_exchange(prev, new, Ordering::AcqRel, Ordering::Relaxed);
+        loop {
+            let prev = self.tokens.load(Ordering::Acquire);
+            let new = (prev + refill).min(self.max_tokens);
+            if self
+                .tokens
+                .compare_exchange(prev, new, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
     }
 }
 
@@ -166,11 +183,11 @@ pub struct IpPermit {
 
 /// Per-IP concurrency limiter.
 pub struct IpRateLimiter {
-    per_ip: Mutex<HashMap<IpAddr, Arc<Semaphore>>>,
+    per_ip: Mutex<HashMap<IpAddr, (Arc<Semaphore>, Instant)>>,
     per_ip_limit: usize,
     global: Arc<Semaphore>,
     per_ip_bandwidth: u64,
-    per_ip_buckets: Mutex<HashMap<IpAddr, TokenBucket>>,
+    per_ip_buckets: Mutex<HashMap<IpAddr, (TokenBucket, Instant)>>,
 }
 
 impl IpRateLimiter {
@@ -206,9 +223,11 @@ impl IpRateLimiter {
 
         let sem = {
             let mut map = self.per_ip.lock().await;
-            map.entry(ip)
-                .or_insert_with(|| Arc::new(Semaphore::new(self.per_ip_limit)))
-                .clone()
+            let entry = map
+                .entry(ip)
+                .or_insert_with(|| (Arc::new(Semaphore::new(self.per_ip_limit)), Instant::now()));
+            entry.1 = Instant::now();
+            entry.0.clone()
         };
 
         match sem.try_acquire_owned() {
@@ -232,12 +251,39 @@ impl IpRateLimiter {
             return None;
         }
         let mut buckets = self.per_ip_buckets.lock().await;
-        Some(
-            buckets
-                .entry(ip)
-                .or_insert_with(|| TokenBucket::new(self.per_ip_bandwidth, self.per_ip_bandwidth))
-                .clone(),
-        )
+        let entry = buckets
+            .entry(ip)
+            .or_insert_with(|| {
+                (
+                    TokenBucket::new(self.per_ip_bandwidth, self.per_ip_bandwidth),
+                    Instant::now(),
+                )
+            });
+        entry.1 = Instant::now();
+        Some(entry.0.clone())
+    }
+
+    pub fn start_sweep(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MAP_ENTRY_TTL);
+            loop {
+                interval.tick().await;
+                this.sweep_stale_entries().await;
+            }
+        });
+    }
+
+    async fn sweep_stale_entries(&self) {
+        let now = Instant::now();
+        {
+            let mut map = self.per_ip.lock().await;
+            map.retain(|_, (_, last_used)| now.duration_since(*last_used) < MAP_ENTRY_TTL);
+        }
+        {
+            let mut map = self.per_ip_buckets.lock().await;
+            map.retain(|_, (_, last_used)| now.duration_since(*last_used) < MAP_ENTRY_TTL);
+        }
     }
 }
 

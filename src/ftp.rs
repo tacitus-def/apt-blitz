@@ -184,6 +184,7 @@ async fn download_range(
     buffer: &SegmentsBuffer,
     offset: u64,
     size: u64,
+    upstream_bucket: &crate::rate_limit::TokenBucket,
 ) -> Result<(), FtpDownloadError> {
     if start > 0 {
         ftp.cmd(&format!("REST {start}")).await
@@ -209,6 +210,7 @@ async fn download_range(
         let to_read = std::cmp::min(buf.len() as u64, size - written) as usize;
         let n = data.read(&mut buf[..to_read]).await?;
         if n == 0 { break; }
+        upstream_bucket.try_consume(n as u64);
         buffer.write_data(offset + written, &buf[..n])
             .map_err(|_| FtpDownloadError::BufferFailed)?;
         written += n as u64;
@@ -224,6 +226,7 @@ async fn download_range(
 pub async fn download_ftp_single(
     url: &FtpUrl,
     buffer: Arc<SegmentsBuffer>,
+    upstream_bucket: &crate::rate_limit::TokenBucket,
 ) -> Result<(), FtpDownloadError> {
     let mut ftp = connect_and_login(url).await
         .map_err(|e| FtpDownloadError::Ftp(e.to_string()))?;
@@ -238,7 +241,7 @@ pub async fn download_ftp_single(
     let data_addr = parse_pasv(&resp)
         .map_err(|e| FtpDownloadError::Ftp(e.to_string()))?;
 
-    download_range(&mut ftp, data_addr, start, &url.path, &buffer, start, end - start).await?;
+    download_range(&mut ftp, data_addr, start, &url.path, &buffer, start, end - start, upstream_bucket).await?;
     buffer.mark_ready(id);
     ftp.cmd("QUIT").await.ok();
     Ok(())
@@ -249,19 +252,22 @@ pub async fn download_ftp_multithreaded(
     buffer: Arc<SegmentsBuffer>,
     num_connections: usize,
     worker_limiter: &crate::rate_limit::WorkerLimiter,
+    upstream_bucket: &crate::rate_limit::TokenBucket,
 ) -> Result<(), FtpDownloadError> {
     let cancel = CancellationToken::new();
     let mut handles = Vec::with_capacity(num_connections);
     let worker_limiter = worker_limiter.clone();
+    let upstream_bucket = upstream_bucket.clone();
 
     for i in 0..num_connections {
         let url = url.clone();
         let buffer = buffer.clone();
         let child_token = cancel.child_token();
         let limiter = worker_limiter.clone();
+        let bucket = upstream_bucket.clone();
         handles.push(tokio::spawn(async move {
             let _permit = limiter.acquire().await;
-            ftp_worker(&url, buffer, child_token, i).await
+            ftp_worker(&url, buffer, child_token, i, &bucket).await
         }));
     }
 
@@ -296,6 +302,7 @@ async fn ftp_worker(
     buffer: Arc<SegmentsBuffer>,
     cancel: CancellationToken,
     worker_id: usize,
+    upstream_bucket: &crate::rate_limit::TokenBucket,
 ) -> Result<(), FtpDownloadError> {
     let mut ftp = connect_and_login(url).await
         .map_err(|e| FtpDownloadError::Ftp(e.to_string()))?;
@@ -323,7 +330,7 @@ async fn ftp_worker(
         let data_addr = parse_pasv(&resp)
             .map_err(|e| FtpDownloadError::Ftp(e.to_string()))?;
 
-        download_range(&mut ftp, data_addr, start, &url.path, &buffer, start, size).await?;
+        download_range(&mut ftp, data_addr, start, &url.path, &buffer, start, size, upstream_bucket).await?;
         buffer.mark_ready(id);
 
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -684,7 +691,8 @@ mod tests {
         };
         let buffer = create_temp_buffer(file_size).await;
         // download_ftp_single calls claim_range internally
-        download_ftp_single(&url, buffer.clone()).await.unwrap();
+        let bucket = crate::rate_limit::TokenBucket::unlimited();
+        download_ftp_single(&url, buffer.clone(), &bucket).await.unwrap();
         assert!(buffer.is_ready(0));
         let read = buffer.read_data(0, file_size).unwrap();
         let expected: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();
@@ -706,7 +714,8 @@ mod tests {
         };
         let buffer = create_temp_buffer(file_size).await;
         let limiter = crate::rate_limit::WorkerLimiter::new(0);
-        download_ftp_multithreaded(&url, buffer.clone(), 4, &limiter).await.unwrap();
+        let bucket = crate::rate_limit::TokenBucket::unlimited();
+        download_ftp_multithreaded(&url, buffer.clone(), 4, &limiter, &bucket).await.unwrap();
         assert!(buffer.all_completed());
         let read = buffer.read_data(0, file_size).unwrap();
         let expected: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();
@@ -727,7 +736,8 @@ mod tests {
             path: "/auth.dat".into(),
         };
         let buffer = create_temp_buffer(file_size).await;
-        download_ftp_single(&url, buffer.clone()).await.unwrap();
+        let bucket = crate::rate_limit::TokenBucket::unlimited();
+        download_ftp_single(&url, buffer.clone(), &bucket).await.unwrap();
         assert!(buffer.is_ready(0));
         let read = buffer.read_data(0, file_size).unwrap();
         assert_eq!(read.len() as u64, file_size);
@@ -782,7 +792,8 @@ mod tests {
             path: "/file.dat".into(),
         };
         let buffer = create_temp_buffer(file_size).await;
-        let result = download_ftp_single(&url, buffer.clone()).await;
+        let bucket = crate::rate_limit::TokenBucket::unlimited();
+        let result = download_ftp_single(&url, buffer.clone(), &bucket).await;
         assert!(result.is_err());
         let _ = std::fs::remove_file(buffer.file_path());
     }
