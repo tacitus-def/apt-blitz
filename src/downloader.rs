@@ -6,11 +6,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::buffer::SegmentsBuffer;
+use crate::rate_limit::{TokenBucket, WorkerLimiter};
 
-const MIN_SEGMENT_SIZE: u64 = 64 * 1024;
-const MAX_SEGMENT_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const MIN_SEGMENT_SIZE: u64 = 64 * 1024;
+pub(crate) const MAX_SEGMENT_SIZE: u64 = 4 * 1024 * 1024;
 const INITIAL_SEGMENT_SIZE: u64 = 1024 * 1024;
-const TARGET_SEGMENT_TIME_SECS: f64 = 2.0;
+pub(crate) const TARGET_SEGMENT_TIME_SECS: f64 = 2.0;
 
 fn next_segment_size(speed: f64) -> u64 {
     if speed <= 0.0 {
@@ -47,17 +48,24 @@ pub async fn download_multithreaded(
     url: &str,
     buffer: Arc<SegmentsBuffer>,
     num_connections: usize,
+    worker_limiter: &WorkerLimiter,
+    upstream_bucket: &TokenBucket,
 ) -> Result<(), DownloadError> {
     let cancel = CancellationToken::new();
     let mut handles = Vec::with_capacity(num_connections);
+    let worker_limiter = worker_limiter.clone();
+    let upstream_bucket = upstream_bucket.clone();
 
     for i in 0..num_connections {
         let client = client.clone();
         let url = url.to_string();
         let buffer = buffer.clone();
         let child_token = cancel.child_token();
+        let bucket = upstream_bucket.clone();
+        let limiter = worker_limiter.clone();
         handles.push(tokio::spawn(async move {
-            download_worker(&client, &url, buffer, child_token, i).await
+            let _permit = limiter.acquire().await;
+            download_worker(&client, &url, buffer, child_token, i, &bucket).await
         }));
     }
 
@@ -92,6 +100,7 @@ async fn download_worker(
     buffer: Arc<SegmentsBuffer>,
     cancel: CancellationToken,
     worker_id: usize,
+    upstream_bucket: &TokenBucket,
 ) -> Result<(), DownloadError> {
     let mut preferred_size = INITIAL_SEGMENT_SIZE;
 
@@ -141,8 +150,12 @@ async fn download_worker(
                 return Err(DownloadError::Cancelled);
             }
             let chunk = chunk?;
+            let len = chunk.len() as u64;
+            if !upstream_bucket.wait_consume(len, &cancel).await {
+                return Err(DownloadError::Cancelled);
+            }
             buffer.write_data(file_offset, &chunk)?;
-            file_offset += chunk.len() as u64;
+            file_offset += len;
         }
 
         buffer.mark_ready(id);
@@ -297,18 +310,7 @@ mod tests {
     }
 
     fn create_temp_buffer(size: u64) -> Arc<SegmentsBuffer> {
-        let dir = std::env::temp_dir().join("apt-blitz-test-downloader");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{}.download", uuid::Uuid::new_v4()));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(size).unwrap();
-        let (buffer, _) = SegmentsBuffer::new(size, file, path);
-        buffer
+        crate::test_util::create_temp_buffer(size)
     }
 
     #[tokio::test]
@@ -334,8 +336,9 @@ mod tests {
         let url = format!("{}/test.dat", server.uri());
         let buffer = create_temp_buffer(data.len() as u64);
         let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket).await;
         assert!(result.is_ok());
 
         assert!(buffer.all_completed());
@@ -368,10 +371,11 @@ mod tests {
         let url = format!("{}/slow.dat", server.uri());
         let buffer = create_temp_buffer(data_len);
         let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
 
         cancel.cancel();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
     }
 }

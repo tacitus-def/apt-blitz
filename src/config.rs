@@ -104,6 +104,11 @@ pub struct Config {
     pub url_maps: Vec<UrlMap>,
     pub upstream_proxy: Option<UpstreamProxy>,
     pub no_proxy: Vec<String>,
+    pub max_connections_per_ip: usize,
+    pub max_total_connections: usize,
+    pub max_workers: usize,
+    pub upstream_bandwidth: u64,
+    pub per_ip_bandwidth: u64,
 }
 
 /// Raw YAML representation — all fields optional (file provides defaults)
@@ -117,6 +122,11 @@ struct YamlConfig {
     url_map: Option<Vec<String>>,
     upstream_proxy: Option<String>,
     no_proxy: Option<Vec<String>>,
+    max_connections_per_ip: Option<usize>,
+    max_total_connections: Option<usize>,
+    max_workers: Option<usize>,
+    upstream_bandwidth: Option<u64>,
+    per_ip_bandwidth: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +165,26 @@ struct Cli {
     /// Comma‑separated hosts to bypass upstream proxy (NO_PROXY syntax)
     #[arg(long, env = "PROXY_NO_PROXY", value_delimiter = ',')]
     no_proxy: Vec<String>,
+
+    /// Max in-flight downloads per client IP (0 = unlimited)
+    #[arg(long, default_value_t = 4, env = "PROXY_MAX_CONNECTIONS_PER_IP")]
+    max_connections_per_ip: usize,
+
+    /// Max total concurrent connections across all IPs (0 = unlimited)
+    #[arg(long, default_value_t = 0, env = "PROXY_MAX_TOTAL_CONNECTIONS")]
+    max_total_connections: usize,
+
+    /// Max total worker threads across all concurrent downloads (0 = unlimited)
+    #[arg(long, default_value_t = 0, env = "PROXY_MAX_WORKERS")]
+    max_workers: usize,
+
+    /// Global upstream bandwidth limit in bytes/sec (0 = unlimited)
+    #[arg(long, default_value_t = 0, env = "PROXY_UPSTREAM_BANDWIDTH")]
+    upstream_bandwidth: u64,
+
+    /// Per-IP bandwidth limit in bytes/sec (0 = unlimited)
+    #[arg(long, default_value_t = 0, env = "PROXY_PER_IP_BANDWIDTH")]
+    per_ip_bandwidth: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +237,11 @@ impl Config {
             url_maps,
             upstream_proxy,
             no_proxy: cli.no_proxy,
+            max_connections_per_ip: cli.max_connections_per_ip,
+            max_total_connections: cli.max_total_connections,
+            max_workers: cli.max_workers,
+            upstream_bandwidth: cli.upstream_bandwidth,
+            per_ip_bandwidth: cli.per_ip_bandwidth,
         })
     }
 
@@ -287,6 +322,11 @@ impl YamlConfig {
                 }
             }
         }
+        set!("MAX_CONNECTIONS_PER_IP", self.max_connections_per_ip);
+        set!("MAX_TOTAL_CONNECTIONS", self.max_total_connections);
+        set!("MAX_WORKERS", self.max_workers);
+        set!("UPSTREAM_BANDWIDTH", self.upstream_bandwidth);
+        set!("PER_IP_BANDWIDTH", self.per_ip_bandwidth);
     }
 }
 
@@ -294,7 +334,7 @@ impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {} }}",
+            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {}, max_connections_per_ip: {}, max_total_connections: {}, max_workers: {}, upstream_bandwidth: {}, per_ip_bandwidth: {} }}",
             self.port,
             self.bind,
             self.connections,
@@ -303,6 +343,11 @@ impl std::fmt::Display for Config {
             self.url_maps.len(),
             self.upstream_proxy.as_ref().map(|u| format!("{:?}://{}:{}", u.proxy_type, u.host, u.port)).unwrap_or_default(),
             self.no_proxy.join(","),
+            self.max_connections_per_ip,
+            self.max_total_connections,
+            self.max_workers,
+            self.upstream_bandwidth,
+            self.per_ip_bandwidth,
         )
     }
 }
@@ -460,6 +505,11 @@ no_proxy:
         std::env::remove_var("PROXY_URL_MAP");
         std::env::remove_var("PROXY_UPSTREAM_PROXY");
         std::env::remove_var("PROXY_NO_PROXY");
+        std::env::remove_var("PROXY_MAX_CONNECTIONS_PER_IP");
+        std::env::remove_var("PROXY_MAX_TOTAL_CONNECTIONS");
+        std::env::remove_var("PROXY_MAX_WORKERS");
+        std::env::remove_var("PROXY_UPSTREAM_BANDWIDTH");
+        std::env::remove_var("PROXY_PER_IP_BANDWIDTH");
     }
 
     #[test]
@@ -498,6 +548,11 @@ no_proxy:
             url_maps: vec![UrlMap::parse("a=http://a.com").unwrap()],
             upstream_proxy: None,
             no_proxy: vec![],
+            max_connections_per_ip: 4,
+            max_total_connections: 0,
+            max_workers: 0,
+            upstream_bandwidth: 0,
+            per_ip_bandwidth: 0,
         };
         let s = format!("{cfg}");
         assert!(s.contains("8080"));
@@ -559,6 +614,11 @@ no_proxy:
             url_maps: vec![],
             upstream_proxy: None,
             no_proxy: vec![],
+            max_connections_per_ip: 4,
+            max_total_connections: 0,
+            max_workers: 0,
+            upstream_bandwidth: 0,
+            per_ip_bandwidth: 0,
         };
         let output = cfg.to_string();
         assert!(output.contains("port: 8080"));
@@ -587,6 +647,11 @@ no_proxy:
             url_map: None,
             upstream_proxy: None,
             no_proxy: None,
+            max_connections_per_ip: None,
+            max_total_connections: None,
+            max_workers: None,
+            upstream_bandwidth: None,
+            per_ip_bandwidth: None,
         };
         yaml.apply_env();
 

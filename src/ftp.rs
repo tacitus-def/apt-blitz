@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::buffer::SegmentsBuffer;
+use crate::downloader::{MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE, TARGET_SEGMENT_TIME_SECS};
 
 #[derive(Debug, Clone)]
 pub struct FtpUrl {
@@ -247,15 +248,19 @@ pub async fn download_ftp_multithreaded(
     url: &FtpUrl,
     buffer: Arc<SegmentsBuffer>,
     num_connections: usize,
+    worker_limiter: &crate::rate_limit::WorkerLimiter,
 ) -> Result<(), FtpDownloadError> {
     let cancel = CancellationToken::new();
     let mut handles = Vec::with_capacity(num_connections);
+    let worker_limiter = worker_limiter.clone();
 
     for i in 0..num_connections {
         let url = url.clone();
         let buffer = buffer.clone();
         let child_token = cancel.child_token();
+        let limiter = worker_limiter.clone();
         handles.push(tokio::spawn(async move {
+            let _permit = limiter.acquire().await;
             ftp_worker(&url, buffer, child_token, i).await
         }));
     }
@@ -324,8 +329,8 @@ async fn ftp_worker(
         let elapsed = start_time.elapsed().as_secs_f64();
         if elapsed > 0.0 {
             let speed = size as f64 / elapsed;
-            let preferred = (speed * 2.0) as u64;
-            preferred_size = preferred.clamp(64 * 1024, 4 * 1024 * 1024);
+            let preferred = (speed * TARGET_SEGMENT_TIME_SECS) as u64;
+            preferred_size = preferred.clamp(MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE);
         }
     }
 
@@ -662,18 +667,7 @@ mod tests {
     }
 
     async fn create_temp_buffer(file_size: u64) -> Arc<SegmentsBuffer> {
-        let dir = std::env::temp_dir().join("apt-blitz-test-ftp-buffer");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{}.download", uuid::Uuid::new_v4()));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(file_size).unwrap();
-        let (buffer, _) = SegmentsBuffer::new(file_size, file, path);
-        buffer
+        crate::test_util::create_temp_buffer(file_size)
     }
 
     #[tokio::test]
@@ -711,7 +705,8 @@ mod tests {
             path: "/bigfile.dat".into(),
         };
         let buffer = create_temp_buffer(file_size).await;
-        download_ftp_multithreaded(&url, buffer.clone(), 4).await.unwrap();
+        let limiter = crate::rate_limit::WorkerLimiter::new(0);
+        download_ftp_multithreaded(&url, buffer.clone(), 4, &limiter).await.unwrap();
         assert!(buffer.all_completed());
         let read = buffer.read_data(0, file_size).unwrap();
         let expected: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();

@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -17,7 +19,14 @@ use crate::cache::Cache;
 use crate::coalescer::{Coalescer, RegisterResult};
 use crate::config::{Config, ProxyType, UrlMap};
 use crate::downloader::download_multithreaded;
+
+enum CoalesceOutcome {
+    Cached { path: std::path::PathBuf, headers: HeaderMap },
+    FollowerBuffer(Arc<SegmentsBuffer>),
+    Leader,
+}
 use crate::ftp;
+use crate::rate_limit::{IpPermit, IpRateLimiter, TokenBucket, WorkerLimiter};
 
 fn can_multithread(content_length: Option<u64>, accept_ranges: Option<&http::HeaderValue>) -> bool {
     content_length.is_some() && accept_ranges == Some(&http::HeaderValue::from_static("bytes"))
@@ -33,6 +42,96 @@ const FORWARD_HEADERS: &[&str] = &[
     "cache-control",
     "expires",
 ];
+
+fn copy_forward_headers(from: &HeaderMap, to: &mut HeaderMap) {
+    for name in FORWARD_HEADERS {
+        if let Some(val) = from.get(*name) {
+            to.insert(*name, val.clone());
+        }
+    }
+}
+
+fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
+    download_handle: tokio::task::JoinHandle<Result<(), E>>,
+    buffer: Arc<SegmentsBuffer>,
+    url: String,
+    headers: HeaderMap,
+    cache: Arc<Cache>,
+    coalescer: Arc<Coalescer>,
+) {
+    tokio::spawn(async move {
+        match download_handle.await {
+            Ok(Ok(())) => {
+                info!(url = %url, "download complete, storing to cache");
+                let sync_buf = buffer.clone();
+                if tokio::task::spawn_blocking(move || sync_buf.sync())
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+                {
+                    if let Err(e) = cache.store(&url, buffer.file_path(), &headers).await {
+                        error!(error = %e, "failed to store in cache");
+                        let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                    }
+                } else {
+                    error!("sync failed before cache store");
+                    let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                }
+            }
+            Ok(Err(e)) => {
+                error!(url = %url, error = ?e, "download failed, cleaning up");
+                buffer.set_failed();
+                let _ = tokio::fs::remove_file(buffer.file_path()).await;
+            }
+            Err(e) => {
+                error!(url = %url, error = ?e, "download task panicked, cleaning up temp");
+                buffer.set_failed();
+                let _ = tokio::fs::remove_file(buffer.file_path()).await;
+            }
+        }
+        coalescer.complete(&url);
+    });
+}
+
+async fn resolve_with_coalescing(
+    url: &str,
+    cache: &Cache,
+    coalescer: &Coalescer,
+) -> Result<CoalesceOutcome, ProxyError> {
+    let mut retries = 0u32;
+    loop {
+        if retries >= 5 {
+            return Err(ProxyError::Internal("too many retries waiting for in-flight download".into()));
+        }
+        retries += 1;
+
+        if let Some((cached_path, cached_headers)) = cache.lookup(url).await {
+            info!(url = %url, path = %cached_path.display(), "cache hit");
+            return Ok(CoalesceOutcome::Cached { path: cached_path, headers: cached_headers });
+        }
+
+        match coalescer.register(url) {
+            RegisterResult::Follower(rx) => {
+                info!(url = %url, "joining in-flight download as follower");
+                let buffer = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                    Ok(Ok(buf)) => buf,
+                    _ => {
+                        info!(url = %url, "follower wait failed, retrying");
+                        continue;
+                    }
+                };
+                return Ok(CoalesceOutcome::FollowerBuffer(buffer));
+            }
+            RegisterResult::FollowerBuffer(buffer) => {
+                info!(url = %url, "joining completed in-flight download");
+                return Ok(CoalesceOutcome::FollowerBuffer(buffer));
+            }
+            RegisterResult::Leader => {
+                info!(url = %url, "becoming download leader");
+                return Ok(CoalesceOutcome::Leader);
+            }
+        }
+    }
+}
 
 /// Translate a fake‑host URL (`http://fake-host/…` or `ftp://fake-host/…`) to its real upstream URL.
 fn resolve_url(url: &str, maps: &[UrlMap]) -> String {
@@ -59,6 +158,37 @@ pub struct AppState {
     pub cache: Arc<Cache>,
     pub coalescer: Arc<Coalescer>,
     pub temp_dir: PathBuf,
+    pub ip_limiter: Arc<IpRateLimiter>,
+    pub worker_limiter: Arc<WorkerLimiter>,
+    pub upstream_bucket: Arc<TokenBucket>,
+}
+
+impl AppState {
+    pub fn from_config(config: Config, client: Client) -> Self {
+        let cache = Cache::new(config.cache_dir.clone(), config.max_cache_size)
+            .expect("failed to init cache");
+        let temp_dir = config.cache_dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        Self {
+            client,
+            config: Arc::new(config.clone()),
+            cache,
+            coalescer: Arc::new(Coalescer::new()),
+            temp_dir,
+            ip_limiter: Arc::new(IpRateLimiter::new(
+                config.max_connections_per_ip,
+                config.max_total_connections,
+                config.per_ip_bandwidth,
+            )),
+            worker_limiter: Arc::new(WorkerLimiter::new(config.max_workers)),
+            upstream_bucket: Arc::new(if config.upstream_bandwidth == 0 {
+                TokenBucket::unlimited()
+            } else {
+                TokenBucket::new(config.upstream_bandwidth, config.upstream_bandwidth)
+            }),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +196,7 @@ pub enum ProxyError {
     BadRequest(String),
     Upstream(reqwest::Error),
     Internal(String),
+    TooManyRequests,
 }
 
 impl IntoResponse for ProxyError {
@@ -74,6 +205,10 @@ impl IntoResponse for ProxyError {
             ProxyError::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             ProxyError::Upstream(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
             ProxyError::Internal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+            ProxyError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded".into(),
+            ),
         };
         Response::builder()
             .status(status)
@@ -88,11 +223,49 @@ impl From<reqwest::Error> for ProxyError {
     }
 }
 
+struct HoldPermitStream<S> {
+    inner: S,
+    _permit: IpPermit,
+}
+
+impl<S> futures_util::Stream for HoldPermitStream<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+fn wrap_response_with_permit(resp: Response, permit: IpPermit) -> Response {
+    let (parts, body) = resp.into_parts();
+    let stream = body.into_data_stream();
+    let mapped = stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let wrapped = HoldPermitStream {
+        inner: mapped,
+        _permit: permit,
+    };
+    Response::from_parts(parts, Body::from_stream(wrapped))
+}
+
 pub async fn handle_proxy(
     method: Method,
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Response, ProxyError> {
+    let peer_ip = req
+        .extensions()
+        .get::<std::net::SocketAddr>()
+        .map(|a| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    let mut ip_permit = Some(state.ip_limiter.acquire(peer_ip).await.ok_or_else(|| {
+        ProxyError::TooManyRequests
+    })?);
+    let _per_ip_bucket = ip_permit.as_ref().and_then(|p| p.per_ip_bucket.clone());
+
     let uri_str = req.uri().to_string();
     let original_url = uri_str.strip_prefix('/').unwrap_or(&uri_str).to_string();
     let url = if original_url.contains("://") {
@@ -123,52 +296,30 @@ pub async fn handle_proxy(
     if method == Method::HEAD {
         info!(url = %url, "HEAD request, forwarding without body");
         let resp = state.client.head(&url).send().await?;
+        let mut fwd = HeaderMap::new();
+        copy_forward_headers(resp.headers(), &mut fwd);
         let mut builder = Response::builder().status(resp.status());
-        for name in FORWARD_HEADERS {
-            if let Some(val) = resp.headers().get(*name) {
-                builder = builder.header(*name, val);
-            }
+        for (name, val) in &fwd {
+            builder = builder.header(name, val);
         }
         return Ok(builder.body(Body::empty()).unwrap());
     }
 
     if url.starts_with("ftp://") || url.starts_with("ftps://") {
-        return handle_ftp_proxy(&url, &state).await;
+        let resp = handle_ftp_proxy(&url, &state).await?;
+        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
     }
 
-    let mut retries = 0u32;
-    loop {
-        if retries >= 5 {
-            return Err(ProxyError::Internal("too many retries waiting for in-flight download".into()));
+    match resolve_with_coalescing(&url, &state.cache, &state.coalescer).await? {
+        CoalesceOutcome::Cached { path, headers } => {
+            let resp = serve_file(&path, &headers).await?;
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
         }
-        retries += 1;
-
-        if let Some((cached_path, cached_headers)) = state.cache.lookup(&url).await {
-            info!(url = %url, path = %cached_path.display(), "cache hit");
-            return serve_file(&cached_path, &cached_headers).await;
+        CoalesceOutcome::FollowerBuffer(buffer) => {
+            let resp = serve_from_buffer(buffer, &url).await;
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
         }
-
-        match state.coalescer.register(&url) {
-            RegisterResult::Follower(rx) => {
-                info!(url = %url, "joining in-flight download as follower");
-                let buffer = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-                    Ok(Ok(buf)) => buf,
-                    _ => {
-                        info!(url = %url, "follower wait failed, retrying");
-                        continue;
-                    }
-                };
-                return Ok(serve_from_buffer(buffer, &url).await);
-            }
-            RegisterResult::FollowerBuffer(buffer) => {
-                info!(url = %url, "joining completed in-flight download");
-                return Ok(serve_from_buffer(buffer, &url).await);
-            }
-            RegisterResult::Leader => {
-                info!(url = %url, "becoming download leader");
-                break;
-            }
-        }
+        CoalesceOutcome::Leader => {}
     }
 
     let head_resp = state.client.head(&url).send().await?;
@@ -178,7 +329,8 @@ pub async fn handle_proxy(
             || head_status == StatusCode::NOT_IMPLEMENTED
         {
             state.coalescer.complete(&url);
-            return plain_proxy(&state.client, &url).await;
+            let resp = plain_proxy(&state.client, &url, &state.upstream_bucket).await?;
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
         }
         state.coalescer.complete(&url);
         head_resp.error_for_status().map_err(ProxyError::Upstream)?;
@@ -199,7 +351,8 @@ pub async fn handle_proxy(
             "falling back to plain proxy"
         );
         state.coalescer.complete(&url);
-        return plain_proxy(&state.client, &url).await;
+        let resp = plain_proxy(&state.client, &url, &state.upstream_bucket).await?;
+        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
     }
 
     let total_size = content_length.unwrap();
@@ -223,11 +376,7 @@ pub async fn handle_proxy(
     let (buffer, notify_rx) = SegmentsBuffer::new(total_size, temp_file, temp_path);
 
     let mut resp_headers = HeaderMap::new();
-    for key in FORWARD_HEADERS {
-        if let Some(val) = headers.get(*key) {
-            resp_headers.insert(*key, val.clone());
-        }
-    }
+    copy_forward_headers(&headers, &mut resp_headers);
 
     let resp_status = StatusCode::OK;
     buffer.set_meta(resp_status, resp_headers.clone());
@@ -239,45 +388,28 @@ pub async fn handle_proxy(
     let dl_url = url.clone();
     let dl_buffer = buffer.clone();
     let dl_connections = state.config.connections;
+    let dl_worker_limiter = state.worker_limiter.clone();
+    let dl_upstream_bucket = state.upstream_bucket.clone();
     let download_handle = tokio::spawn(async move {
-        download_multithreaded(&dl_client, &dl_url, dl_buffer, dl_connections).await
+        download_multithreaded(
+            &dl_client,
+            &dl_url,
+            dl_buffer,
+            dl_connections,
+            &dl_worker_limiter,
+            &dl_upstream_bucket,
+        )
+        .await
     });
 
-    let cache_headers = resp_headers.clone();
-    let cache_state = state.clone();
-    let cache_url = url.clone();
-    let cache_buffer = buffer.clone();
-    tokio::spawn(async move {
-        match download_handle.await {
-            Ok(Ok(())) => {
-                info!(url = %cache_url, "download complete, storing to cache");
-                let sync_buf = cache_buffer.clone();
-                if tokio::task::spawn_blocking(move || sync_buf.sync())
-                    .await
-                    .is_ok_and(|r| r.is_ok())
-                {
-                    if let Err(e) = cache_state.cache.store(&cache_url, cache_buffer.file_path(), &cache_headers).await {
-                        error!(error = %e, "failed to store in cache");
-                        let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                    }
-                } else {
-                    error!("sync failed before cache store");
-                    let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                }
-            }
-            Ok(Err(e)) => {
-                error!(url = %cache_url, error = ?e, "multithreaded download failed, cleaning up");
-                cache_buffer.set_failed();
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-            Err(e) => {
-                error!(url = %cache_url, error = ?e, "download task panicked, cleaning up temp");
-                cache_buffer.set_failed();
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-        }
-        cache_state.coalescer.complete(&cache_url);
-    });
+    spawn_cache_persistence(
+        download_handle,
+        buffer.clone(),
+        url.clone(),
+        resp_headers.clone(),
+        state.cache.clone(),
+        state.coalescer.clone(),
+    );
 
     let stream = make_buffer_stream(buffer, notify_rx, &url);
     let mut resp_builder = Response::builder().status(resp_status);
@@ -286,45 +418,20 @@ pub async fn handle_proxy(
     }
     let resp = resp_builder.body(Body::from_stream(stream)).unwrap();
 
-    Ok(resp)
+    Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()))
 }
 
 async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, ProxyError> {
     info!(url = %url, "ftp request");
 
-    let mut retries = 0u32;
-    loop {
-        if retries >= 5 {
-            return Err(ProxyError::Internal("too many retries waiting for in-flight FTP download".into()));
+    match resolve_with_coalescing(url, &state.cache, &state.coalescer).await? {
+        CoalesceOutcome::Cached { path, headers } => {
+            return serve_file(&path, &headers).await;
         }
-        retries += 1;
-
-        if let Some((cached_path, cached_headers)) = state.cache.lookup(url).await {
-            info!(url = %url, path = %cached_path.display(), "FTP cache hit");
-            return serve_file(&cached_path, &cached_headers).await;
+        CoalesceOutcome::FollowerBuffer(buffer) => {
+            return Ok(serve_from_buffer(buffer, url).await);
         }
-
-        match state.coalescer.register(url) {
-            RegisterResult::Follower(rx) => {
-                info!(url = %url, "joining in-flight FTP download as follower");
-                let buffer = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-                    Ok(Ok(buf)) => buf,
-                    _ => {
-                        info!(url = %url, "FTP follower wait failed, retrying");
-                        continue;
-                    }
-                };
-                return Ok(serve_from_buffer(buffer, url).await);
-            }
-            RegisterResult::FollowerBuffer(buffer) => {
-                info!(url = %url, "joining completed in-flight FTP download");
-                return Ok(serve_from_buffer(buffer, url).await);
-            }
-            RegisterResult::Leader => {
-                info!(url = %url, "becoming FTP download leader");
-                break;
-            }
-        }
+        CoalesceOutcome::Leader => {}
     }
 
     let ftp_url = match ftp::parse_ftp_url(url) {
@@ -363,43 +470,19 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
     let dl_url = ftp_url.clone();
     let dl_buffer = buffer.clone();
     let dl_connections = state.config.connections;
+    let dl_worker_limiter = state.worker_limiter.clone();
     let download_handle = tokio::spawn(async move {
-        ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections).await
+        ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections, &dl_worker_limiter).await
     });
 
-    let cache_headers = resp_headers.clone();
-    let cache_state = state.clone();
-    let cache_url = url.to_string();
-    let cache_buffer = buffer.clone();
-    tokio::spawn(async move {
-        match download_handle.await {
-            Ok(Ok(())) => {
-                info!(url = %cache_url, "FTP download complete, storing to cache");
-                let sync_buf = cache_buffer.clone();
-                if tokio::task::spawn_blocking(move || sync_buf.sync())
-                    .await
-                    .is_ok_and(|r| r.is_ok())
-                {
-                    if let Err(e) = cache_state.cache.store(&cache_url, cache_buffer.file_path(), &cache_headers).await {
-                        error!(error = %e, "FTP cache store failed");
-                        let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                    }
-                } else {
-                    error!("FTP sync failed before cache store");
-                    let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                }
-            }
-            Ok(Err(e)) => {
-                error!(url = %cache_url, error = ?e, "FTP download failed");
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-            Err(e) => {
-                error!(url = %cache_url, error = ?e, "FTP download task panicked");
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-        }
-        cache_state.coalescer.complete(&cache_url);
-    });
+    spawn_cache_persistence(
+        download_handle,
+        buffer.clone(),
+        url.to_string(),
+        resp_headers.clone(),
+        state.cache.clone(),
+        state.coalescer.clone(),
+    );
 
     let stream = make_buffer_stream(buffer, notify_rx, url);
     let mut resp_builder = Response::builder().status(resp_status);
@@ -514,22 +597,44 @@ fn make_buffer_stream(
     })
 }
 
-async fn plain_proxy(client: &Client, url: &str) -> Result<Response, ProxyError> {
+async fn plain_proxy(
+    client: &Client,
+    url: &str,
+    upstream_bucket: &TokenBucket,
+) -> Result<Response, ProxyError> {
     info!(url = %url, "plain proxy mode");
 
     let resp = client.get(url).send().await?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 
-    let stream = resp.bytes_stream().map(|r| {
-        r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    let bucket = upstream_bucket.clone();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let stream = resp.bytes_stream().filter_map(move |r| {
+        let bucket = bucket.clone();
+        let cancel = cancel.clone();
+        async move {
+            match r {
+                Ok(chunk) => {
+                    let len = chunk.len() as u64;
+                    if !bucket.wait_consume(len, &cancel).await {
+                        return None;
+                    }
+                    Some(Ok(chunk))
+                }
+                Err(e) => Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e,
+                ))),
+            }
+        }
     });
 
+    let mut fwd = HeaderMap::new();
+    copy_forward_headers(&resp_headers, &mut fwd);
     let mut builder = Response::builder().status(status);
-    for name in FORWARD_HEADERS {
-        if let Some(val) = resp_headers.get(*name) {
-            builder = builder.header(*name, val);
-        }
+    for (name, val) in &fwd {
+        builder = builder.header(name, val);
     }
 
     Ok(builder.body(Body::from_stream(stream)).unwrap())
