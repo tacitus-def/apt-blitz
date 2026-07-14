@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -238,12 +239,48 @@ struct ThrottledPermitStream<S> {
     cancel: CancellationToken,
     state: ThrottleState,
     timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
-    data: Option<bytes::Bytes>,
+    pending: VecDeque<bytes::Bytes>,
 }
 
 enum ThrottleState {
     Idle,
     Waiting,
+}
+
+impl<S> ThrottledPermitStream<S> {
+    fn enqueue_chunk(&mut self, chunk: bytes::Bytes) {
+        if let Some(ref bucket) = self.bucket {
+            let max = bucket.max_tokens();
+            if chunk.len() as u64 <= max {
+                self.pending.push_back(chunk);
+            } else {
+                let mut offset = 0usize;
+                while offset < chunk.len() {
+                    let end = (offset + max as usize).min(chunk.len());
+                    self.pending.push_back(chunk.slice(offset..end));
+                    offset = end;
+                }
+            }
+        } else {
+            self.pending.push_back(chunk);
+        }
+    }
+
+    fn try_deliver(&mut self) -> Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
+        if let Some(ref bucket) = self.bucket {
+            while let Some(front) = self.pending.front() {
+                let len = front.len() as u64;
+                if bucket.try_consume(len) {
+                    let chunk = self.pending.pop_front().unwrap();
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                return Poll::Pending;
+            }
+        } else if let Some(chunk) = self.pending.pop_front() {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
+        Poll::Pending
+    }
 }
 
 impl<S> futures_util::Stream for ThrottledPermitStream<S>
@@ -259,23 +296,53 @@ where
 
         match self.state {
             ThrottleState::Idle => {
+                // Deliver from pending buffer first.
+                if self.bucket.is_some() && !self.pending.is_empty() {
+                    match self.try_deliver() {
+                        Poll::Ready(item) => return Poll::Ready(item),
+                        Poll::Pending => {
+                            self.state = ThrottleState::Waiting;
+                            self.schedule_wake(cx);
+                            return Poll::Pending;
+                        }
+                    }
+                }
+
                 match Pin::new(&mut self.inner).poll_next(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Pending => {
+                        // Inner exhausted but pending has data — go to Waiting.
+                        if self.bucket.is_some() && !self.pending.is_empty() {
+                            self.state = ThrottleState::Waiting;
+                            self.schedule_wake(cx);
+                        }
+                        Poll::Pending
+                    }
+                    Poll::Ready(None) => {
+                        if self.pending.is_empty() {
+                            Poll::Ready(None)
+                        } else if self.bucket.is_none() {
+                            let chunk = self.pending.pop_front().unwrap();
+                            Poll::Ready(Some(Ok(chunk)))
+                        } else {
+                            self.state = ThrottleState::Waiting;
+                            self.schedule_wake(cx);
+                            Poll::Pending
+                        }
+                    }
                     Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
                     Poll::Ready(Some(Ok(chunk))) => {
-                        if let Some(ref bucket) = self.bucket {
-                            let len = chunk.len() as u64;
-                            if bucket.try_consume(len) {
-                                Poll::Ready(Some(Ok(chunk)))
-                            } else {
-                                self.data = Some(chunk);
+                        self.enqueue_chunk(chunk);
+                        if self.bucket.is_none() {
+                            let chunk = self.pending.pop_front().unwrap();
+                            return Poll::Ready(Some(Ok(chunk)));
+                        }
+                        match self.try_deliver() {
+                            Poll::Ready(item) => Poll::Ready(item),
+                            Poll::Pending => {
                                 self.state = ThrottleState::Waiting;
                                 self.schedule_wake(cx);
                                 Poll::Pending
                             }
-                        } else {
-                            Poll::Ready(Some(Ok(chunk)))
                         }
                     }
                 }
@@ -287,22 +354,20 @@ where
                     }
                 }
                 self.timer = None;
-                self.state = ThrottleState::Idle;
 
-                if let Some(chunk) = self.data.take() {
-                    if let Some(ref bucket) = self.bucket {
-                        let len = chunk.len() as u64;
-                        if bucket.try_consume(len) {
-                            return Poll::Ready(Some(Ok(chunk)));
-                        }
-                        self.data = Some(chunk);
-                        self.state = ThrottleState::Waiting;
-                        self.schedule_wake(cx);
-                        return Poll::Pending;
+                match self.try_deliver() {
+                    Poll::Ready(item) => {
+                        self.state = ThrottleState::Idle;
+                        Poll::Ready(item)
                     }
-                    Poll::Ready(Some(Ok(chunk)))
-                } else {
-                    Poll::Pending
+                    Poll::Pending => {
+                        if self.pending.is_empty() {
+                            self.state = ThrottleState::Idle;
+                            return Poll::Pending;
+                        }
+                        self.schedule_wake(cx);
+                        Poll::Pending
+                    }
                 }
             }
         }
@@ -312,7 +377,7 @@ where
 impl<S> ThrottledPermitStream<S> {
     fn schedule_wake(&mut self, cx: &mut Context<'_>) {
         if let Some(ref bucket) = self.bucket {
-            let remaining = self.data.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+            let remaining: u64 = self.pending.iter().map(|c| c.len() as u64).sum();
             if remaining == 0 {
                 return;
             }
@@ -340,7 +405,7 @@ fn wrap_response_with_permit(resp: Response, permit: IpPermit, cancel: Cancellat
         cancel,
         state: ThrottleState::Idle,
         timer: None,
-        data: None,
+        pending: VecDeque::new(),
     };
     Response::from_parts(parts, Body::from_stream(wrapped))
 }
@@ -1355,7 +1420,7 @@ mod tests {
             cancel,
             state: ThrottleState::Idle,
             timer: None,
-            data: None,
+            pending: VecDeque::new(),
         };
 
         let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
@@ -1388,7 +1453,7 @@ mod tests {
             cancel,
             state: ThrottleState::Idle,
             timer: None,
-            data: None,
+            pending: VecDeque::new(),
         };
 
         let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
@@ -1419,7 +1484,7 @@ mod tests {
             cancel,
             state: ThrottleState::Idle,
             timer: None,
-            data: None,
+            pending: VecDeque::new(),
         };
 
         let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
@@ -1475,11 +1540,51 @@ mod tests {
             cancel,
             state: ThrottleState::Idle,
             timer: None,
-            data: None,
+            pending: VecDeque::new(),
         };
 
         let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_oversized_chunk_splits() {
+        let data = vec![0xABu8; 250];
+        let chunk = bytes::Bytes::from(data.clone());
+        assert_eq!(chunk.len(), 250);
+        let inner = futures_util::stream::iter(vec![Ok(chunk)]);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(100, 1000); // max_tokens = 100, refill 1000/s
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            pending: VecDeque::new(),
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].as_ref().unwrap().len(), 100);
+        assert_eq!(result[1].as_ref().unwrap().len(), 100);
+        assert_eq!(result[2].as_ref().unwrap().len(), 50);
+
+        let mut assembled = Vec::new();
+        for r in &result {
+            assembled.extend_from_slice(r.as_ref().unwrap());
+        }
+        assert_eq!(assembled.as_slice(), data.as_slice());
     }
 }
 

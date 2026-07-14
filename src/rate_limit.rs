@@ -102,6 +102,11 @@ impl TokenBucket {
         self.inner.tokens.load(Ordering::Relaxed)
     }
 
+    /// Maximum token capacity (burst size).
+    pub fn max_tokens(&self) -> u64 {
+        self.inner.max_tokens
+    }
+
     /// Estimate nanoseconds until `amount` tokens become available via refill.
     /// Returns 0 if tokens are already available or bucket is unlimited.
     pub fn wait_time_nanos(&self, amount: u64) -> u64 {
