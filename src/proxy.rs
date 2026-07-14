@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Body;
@@ -33,6 +34,44 @@ enum CoalesceOutcome {
 }
 use crate::ftp;
 use crate::rate_limit::{IpPermit, IpRateLimiter, TokenBucket, WorkerLimiter};
+
+const FAILURE_COOLDOWN_SECS: u64 = 60;
+const MAX_FAILURES_BEFORE_COOLDOWN: u32 = 3;
+
+pub struct FailureTracker {
+    failures: Mutex<HashMap<String, (u32, Instant)>>,
+}
+
+impl FailureTracker {
+    pub fn new() -> Self {
+        Self {
+            failures: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn record_failure(&self, url: &str) {
+        let mut map = self.failures.lock().unwrap();
+        let entry = map.entry(url.to_string()).or_insert((0, Instant::now()));
+        entry.0 += 1;
+        entry.1 = Instant::now();
+    }
+
+    fn record_success(&self, url: &str) {
+        self.failures.lock().unwrap().remove(url);
+    }
+
+    fn is_in_cooldown(&self, url: &str) -> bool {
+        let map = self.failures.lock().unwrap();
+        if let Some((count, last_failure)) = map.get(url) {
+            if *count >= MAX_FAILURES_BEFORE_COOLDOWN
+                && last_failure.elapsed() < Duration::from_secs(FAILURE_COOLDOWN_SECS)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
 
 fn can_multithread(content_length: Option<u64>, accept_ranges: Option<&http::HeaderValue>) -> bool {
     content_length.is_some() && accept_ranges == Some(&http::HeaderValue::from_static("bytes"))
@@ -64,12 +103,14 @@ fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
     headers: HeaderMap,
     cache: Arc<Cache>,
     coalescer: Arc<Coalescer>,
+    failure_tracker: Arc<FailureTracker>,
     req_id: u64,
 ) {
     tokio::spawn(async move {
         match download_handle.await {
             Ok(Ok(())) => {
                 info!(req_id, url = %url, "download complete, storing to cache");
+                failure_tracker.record_success(&url);
                 let sync_buf = buffer.clone();
                 if tokio::task::spawn_blocking(move || sync_buf.sync())
                     .await
@@ -83,19 +124,23 @@ fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
                     error!(req_id, "sync failed before cache store");
                     let _ = tokio::fs::remove_file(buffer.file_path()).await;
                 }
+                coalescer.complete(&url);
             }
             Ok(Err(e)) => {
                 error!(req_id, url = %url, error = ?e, "download failed, cleaning up");
+                failure_tracker.record_failure(&url);
                 buffer.set_failed();
                 let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                coalescer.fail(&url);
             }
             Err(e) => {
                 error!(req_id, url = %url, error = ?e, "download task panicked, cleaning up temp");
+                failure_tracker.record_failure(&url);
                 buffer.set_failed();
                 let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                coalescer.fail(&url);
             }
         }
-        coalescer.complete(&url);
     });
 }
 
@@ -169,6 +214,7 @@ pub struct AppState {
     pub ip_limiter: Arc<IpRateLimiter>,
     pub worker_limiter: Arc<WorkerLimiter>,
     pub upstream_bucket: Arc<TokenBucket>,
+    pub failure_tracker: Arc<FailureTracker>,
     pub cancel: CancellationToken,
 }
 
@@ -200,6 +246,7 @@ impl AppState {
             } else {
                 TokenBucket::new(config.upstream_bandwidth, config.upstream_bandwidth)
             }),
+            failure_tracker: Arc::new(FailureTracker::new()),
             cancel: CancellationToken::new(),
         }
     }
@@ -489,6 +536,14 @@ async fn handle_proxy_inner(
         return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
+    if state.failure_tracker.is_in_cooldown(&url) {
+        warn!(req_id, url = %url, "upstream in failure cooldown, rejecting");
+        state.coalescer.complete(&url);
+        return Err(ProxyError::Internal(format!(
+            "upstream unstable for {}, retry later", url
+        )));
+    }
+
     match resolve_with_coalescing(&url, &state.cache, &state.coalescer, req_id).await? {
         CoalesceOutcome::Cached { path, headers } => {
             let resp = serve_file(&path, &headers).await?;
@@ -592,6 +647,7 @@ async fn handle_proxy_inner(
         resp_headers.clone(),
         state.cache.clone(),
         state.coalescer.clone(),
+        state.failure_tracker.clone(),
         req_id,
     );
 
@@ -668,6 +724,7 @@ async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Re
         resp_headers.clone(),
         state.cache.clone(),
         state.coalescer.clone(),
+        state.failure_tracker.clone(),
         req_id,
     );
 
@@ -1608,6 +1665,67 @@ mod tests {
             assembled.extend_from_slice(r.as_ref().unwrap());
         }
         assert_eq!(assembled.as_slice(), data.as_slice());
+    }
+
+    #[test]
+    fn test_failure_tracker_no_failures() {
+        let tracker = FailureTracker::new();
+        assert!(!tracker.is_in_cooldown("http://example.com/file"));
+    }
+
+    #[test]
+    fn test_failure_tracker_below_threshold() {
+        let tracker = FailureTracker::new();
+        for _ in 0..MAX_FAILURES_BEFORE_COOLDOWN - 1 {
+            tracker.record_failure("http://example.com/file");
+        }
+        assert!(!tracker.is_in_cooldown("http://example.com/file"));
+    }
+
+    #[test]
+    fn test_failure_tracker_at_threshold() {
+        let tracker = FailureTracker::new();
+        for _ in 0..MAX_FAILURES_BEFORE_COOLDOWN {
+            tracker.record_failure("http://example.com/file");
+        }
+        assert!(tracker.is_in_cooldown("http://example.com/file"));
+    }
+
+    #[test]
+    fn test_failure_tracker_success_resets() {
+        let tracker = FailureTracker::new();
+        for _ in 0..MAX_FAILURES_BEFORE_COOLDOWN {
+            tracker.record_failure("http://example.com/file");
+        }
+        assert!(tracker.is_in_cooldown("http://example.com/file"));
+        tracker.record_success("http://example.com/file");
+        assert!(!tracker.is_in_cooldown("http://example.com/file"));
+    }
+
+    #[test]
+    fn test_failure_tracker_different_urls() {
+        let tracker = FailureTracker::new();
+        for _ in 0..MAX_FAILURES_BEFORE_COOLDOWN {
+            tracker.record_failure("http://example.com/a");
+        }
+        assert!(tracker.is_in_cooldown("http://example.com/a"));
+        assert!(!tracker.is_in_cooldown("http://example.com/b"));
+    }
+
+    #[test]
+    fn test_failure_tracker_cooldown_expires() {
+        let tracker = FailureTracker::new();
+        for _ in 0..MAX_FAILURES_BEFORE_COOLDOWN {
+            tracker.record_failure("http://example.com/file");
+        }
+        assert!(tracker.is_in_cooldown("http://example.com/file"));
+        {
+            let mut map = tracker.failures.lock().unwrap();
+            if let Some((_, ref mut ts)) = map.get_mut("http://example.com/file") {
+                *ts = Instant::now() - Duration::from_secs(FAILURE_COOLDOWN_SECS + 1);
+            }
+        }
+        assert!(!tracker.is_in_cooldown("http://example.com/file"));
     }
 }
 

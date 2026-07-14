@@ -65,6 +65,10 @@ impl Coalescer {
     pub fn complete(&self, url: &str) {
         self.inflight.lock().unwrap().remove(url);
     }
+
+    pub fn fail(&self, url: &str) {
+        self.inflight.lock().unwrap().remove(url);
+    }
 }
 
 #[cfg(test)]

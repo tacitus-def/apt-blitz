@@ -1,9 +1,9 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::buffer::SegmentsBuffer;
 use crate::rate_limit::{TokenBucket, WorkerLimiter};
@@ -12,6 +12,13 @@ pub(crate) const MIN_SEGMENT_SIZE: u64 = 64 * 1024;
 pub(crate) const MAX_SEGMENT_SIZE: u64 = 4 * 1024 * 1024;
 const INITIAL_SEGMENT_SIZE: u64 = 1024 * 1024;
 pub(crate) const TARGET_SEGMENT_TIME_SECS: f64 = 2.0;
+
+const MAX_SEGMENT_RETRIES: u32 = 3;
+const BASE_RETRY_DELAY_MS: u64 = 200;
+
+fn is_transient_error(e: &reqwest::Error) -> bool {
+    e.is_connect() || e.is_body() || e.is_timeout()
+}
 
 fn next_segment_size(speed: f64) -> u64 {
     if speed <= 0.0 {
@@ -129,37 +136,113 @@ async fn download_worker(
         );
 
         let start_time = Instant::now();
-        let response = client
-            .get(url)
-            .header("Range", &range_header)
-            .send()
-            .await?;
+        let mut last_err: Option<DownloadError> = None;
+        let mut succeeded = false;
 
-        let status = response.status();
-        if status != StatusCode::PARTIAL_CONTENT && status != StatusCode::OK {
-            error!(
-                req_id,
-                worker = worker_id,
-                segment = id,
-                status = %status,
-                "unexpected status for range request"
-            );
-            return Err(DownloadError::HttpStatus(status));
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut file_offset = start;
-        while let Some(chunk) = stream.next().await {
+        for attempt in 0..=MAX_SEGMENT_RETRIES {
             if cancel.is_cancelled() {
                 return Err(DownloadError::Cancelled);
             }
-            let chunk = chunk?;
-            let len = chunk.len() as u64;
-            if !upstream_bucket.wait_consume(len, &cancel).await {
-                return Err(DownloadError::Cancelled);
+
+            let response = match client
+                .get(url)
+                .header("Range", &range_header)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if is_transient_error(&e) && attempt < MAX_SEGMENT_RETRIES {
+                        let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
+                        warn!(
+                            req_id,
+                            worker = worker_id,
+                            segment = id,
+                            attempt,
+                            delay_ms = delay,
+                            error = %e,
+                            "transient send error, retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        last_err = Some(DownloadError::Reqwest(e));
+                        continue;
+                    }
+                    return Err(DownloadError::Reqwest(e));
+                }
+            };
+
+            let status = response.status();
+            if status != StatusCode::PARTIAL_CONTENT && status != StatusCode::OK {
+                error!(
+                    req_id,
+                    worker = worker_id,
+                    segment = id,
+                    status = %status,
+                    "unexpected status for range request"
+                );
+                return Err(DownloadError::HttpStatus(status));
             }
-            buffer.write_data(file_offset, &chunk)?;
-            file_offset += len;
+
+            let mut stream = response.bytes_stream();
+            let mut file_offset = start;
+            let mut stream_failed = false;
+
+            while let Some(chunk) = stream.next().await {
+                if cancel.is_cancelled() {
+                    return Err(DownloadError::Cancelled);
+                }
+                match chunk {
+                    Ok(chunk) => {
+                        let len = chunk.len() as u64;
+                        if !upstream_bucket.wait_consume(len, &cancel).await {
+                            return Err(DownloadError::Cancelled);
+                        }
+                        buffer.write_data(file_offset, &chunk)?;
+                        file_offset += len;
+                    }
+                    Err(e) => {
+                        if is_transient_error(&e) && attempt < MAX_SEGMENT_RETRIES {
+                            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
+                            warn!(
+                                req_id,
+                                worker = worker_id,
+                                segment = id,
+                                attempt,
+                                delay_ms = delay,
+                                error = %e,
+                                "transient stream error, retrying"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            last_err = Some(DownloadError::Reqwest(e));
+                            stream_failed = true;
+                        } else {
+                            return Err(DownloadError::Reqwest(e));
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if stream_failed {
+                continue;
+            }
+
+            succeeded = true;
+            break;
+        }
+
+        if !succeeded {
+            return Err(last_err.unwrap_or(DownloadError::BufferFailed));
+        }
+
+        if let Some(err) = &last_err {
+            warn!(
+                req_id,
+                worker = worker_id,
+                segment = id,
+                error = ?err,
+                "segment downloaded after retries"
+            );
         }
 
         buffer.mark_ready(id);
@@ -382,5 +465,59 @@ mod tests {
 
         let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
+    }
+
+    #[test]
+    fn test_is_transient_error_connect() {
+        let client = reqwest::Client::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(async {
+            client.get("http://127.0.0.1:1/").send().await.unwrap_err()
+        });
+        assert!(is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_error_status() {
+        let client = reqwest::Client::new();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(async {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(wiremock::ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+            let resp = client.get(format!("{}/fail", server.uri())).send().await.unwrap();
+            resp.error_for_status().unwrap_err()
+        });
+        assert!(!is_transient_error(&err));
+    }
+
+    #[test]
+    fn test_is_transient_error_timeout() {
+        use std::time::Duration;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(async {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_bytes(vec![0u8; 1000])
+                        .set_delay(Duration::from_secs(10)),
+                )
+                .mount(&server)
+                .await;
+            let client = reqwest::Client::builder()
+                .connect_timeout(Duration::from_millis(50))
+                .timeout(Duration::from_millis(100))
+                .build()
+                .unwrap();
+            client
+                .get(format!("{}/slow", server.uri()))
+                .send()
+                .await
+                .unwrap_err()
+        });
+        assert!(is_transient_error(&err));
     }
 }

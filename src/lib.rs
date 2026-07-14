@@ -101,6 +101,7 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
         } else {
             TokenBucket::new(config.upstream_bandwidth, config.upstream_bandwidth)
         }),
+        failure_tracker: Arc::new(proxy::FailureTracker::new()),
         cancel: CancellationToken::new(),
     };
 

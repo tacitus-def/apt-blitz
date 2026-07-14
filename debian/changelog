@@ -1,3 +1,11 @@
+apt-blitz (0.4.1-1) unstable; urgency=medium
+
+  * Add segment-level retry with exponential backoff for transient network errors.
+  * Add per-URL failure cooldown (3 failures / 60s) to prevent retry storms.
+  * Add Coalescer::fail() for explicit failure notification to followers.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 14 Jul 2026 00:00:00 +0300
+
 apt-blitz (0.4.0-1) unstable; urgency=medium
 
   * Add request tracing with per-request ID and spans.
