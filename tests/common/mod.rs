@@ -263,6 +263,47 @@ impl TestContext {
         }
     }
 
+    pub async fn with_config(max_cache_size: u64, config: Config) -> Self {
+        let upstream = MockUpstream::new().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let mut config = config;
+        config.cache_dir = cache_dir.path().join("cache");
+        config.max_cache_size = max_cache_size;
+
+        let client = Client::builder()
+            .user_agent("apt-blitz-test/0.1.0")
+            .build()
+            .unwrap();
+
+        let state = AppState::from_config(config, client.clone());
+
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let proxy_url = format!("http://{addr}");
+
+        let (tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let shutdown_signal = async {
+                rx.await.ok();
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal)
+                .await
+                .ok();
+        });
+
+        Self {
+            upstream,
+            proxy_url,
+            client,
+            shutdown: Some(tx),
+            _cache_dir: cache_dir,
+        }
+    }
+
     pub fn get(&self, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}{}", self.upstream.uri(), path);
         self.client

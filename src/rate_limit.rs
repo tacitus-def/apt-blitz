@@ -269,20 +269,25 @@ impl IpRateLimiter {
             let mut interval = tokio::time::interval(MAP_ENTRY_TTL);
             loop {
                 interval.tick().await;
-                this.sweep_stale_entries().await;
+                this.sweep_stale_entries_at(Instant::now()).await;
             }
         });
     }
 
-    async fn sweep_stale_entries(&self) {
-        let now = Instant::now();
+    async fn sweep_stale_entries_at(&self, now: Instant) {
         {
             let mut map = self.per_ip.lock().await;
-            map.retain(|_, (_, last_used)| now.duration_since(*last_used) < MAP_ENTRY_TTL);
+            map.retain(|_, (_, last_used)| {
+                now.checked_duration_since(*last_used)
+                    .map_or(true, |d| d < MAP_ENTRY_TTL)
+            });
         }
         {
             let mut map = self.per_ip_buckets.lock().await;
-            map.retain(|_, (_, last_used)| now.duration_since(*last_used) < MAP_ENTRY_TTL);
+            map.retain(|_, (_, last_used)| {
+                now.checked_duration_since(*last_used)
+                    .map_or(true, |d| d < MAP_ENTRY_TTL)
+            });
         }
     }
 }
@@ -402,5 +407,164 @@ mod tests {
         let _ = b.try_consume(1000);
         let wait = b.wait_time_nanos(500);
         assert!(wait > 0);
+    }
+
+    #[tokio::test]
+    async fn test_wait_consume_immediate() {
+        let b = TokenBucket::new(1000, 1000);
+        let cancel = CancellationToken::new();
+        assert!(b.wait_consume(500, &cancel).await);
+        assert!(b.available() <= 500);
+    }
+
+    #[tokio::test]
+    async fn test_wait_consume_cancelled() {
+        let b = TokenBucket::new(100, 100);
+        let _ = b.try_consume(100);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(!b.wait_consume(50, &cancel).await);
+    }
+
+    #[tokio::test]
+    async fn test_wait_consume_with_refill() {
+        let b = TokenBucket::new(1000, 500);
+        let _ = b.try_consume(1000);
+        assert_eq!(b.available(), 0);
+        let cancel = CancellationToken::new();
+        let start = std::time::Instant::now();
+        assert!(b.wait_consume(200, &cancel).await);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "should have waited for refill, elapsed: {:?}",
+            elapsed
+        );
+    }
+
+    // --- sweep_stale_entries_at tests ---
+
+    #[tokio::test]
+    async fn test_sweep_removes_stale_per_ip() {
+        let limiter = IpRateLimiter::new(10, 0, 0);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let _permit = limiter.acquire(ip).await.unwrap();
+
+        {
+            let map = limiter.per_ip.lock().await;
+            assert!(map.contains_key(&ip));
+        }
+
+        let future_now = Instant::now() + MAP_ENTRY_TTL + Duration::from_secs(1);
+        limiter.sweep_stale_entries_at(future_now).await;
+
+        {
+            let map = limiter.per_ip.lock().await;
+            assert!(!map.contains_key(&ip));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sweep_keeps_fresh_entries() {
+        let limiter = IpRateLimiter::new(10, 0, 0);
+        let ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let _permit = limiter.acquire(ip).await.unwrap();
+
+        limiter.sweep_stale_entries_at(Instant::now()).await;
+
+        let map = limiter.per_ip.lock().await;
+        assert!(map.contains_key(&ip));
+    }
+
+    #[tokio::test]
+    async fn test_sweep_removes_stale_bucket() {
+        let limiter = IpRateLimiter::new(0, 0, 1024);
+        let ip: IpAddr = "10.0.0.3".parse().unwrap();
+        let _permit = limiter.acquire(ip).await.unwrap();
+
+        {
+            let map = limiter.per_ip_buckets.lock().await;
+            assert!(map.contains_key(&ip));
+        }
+
+        let future_now = Instant::now() + MAP_ENTRY_TTL + Duration::from_secs(1);
+        limiter.sweep_stale_entries_at(future_now).await;
+
+        {
+            let map = limiter.per_ip_buckets.lock().await;
+            assert!(!map.contains_key(&ip));
+        }
+    }
+
+    // --- per_ip_bandwidth tests ---
+
+    #[tokio::test]
+    async fn test_ip_limiter_per_ip_bucket_created() {
+        let limiter = IpRateLimiter::new(0, 0, 4096);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let permit = limiter.acquire(ip).await.unwrap();
+        assert!(permit.per_ip_bucket.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ip_limiter_per_ip_bucket_none() {
+        let limiter = IpRateLimiter::new(0, 0, 0);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let permit = limiter.acquire(ip).await.unwrap();
+        assert!(permit.per_ip_bucket.is_none());
+    }
+
+    // --- CAS contention tests ---
+
+    #[tokio::test]
+    async fn test_try_consume_concurrent() {
+        let b = TokenBucket::new(10_000, 0);
+        let mut handles = Vec::new();
+        for _ in 0..100 {
+            let b = b.clone();
+            handles.push(tokio::spawn(async move {
+                let mut consumed = 0u64;
+                for _ in 0..100 {
+                    if b.try_consume(1) {
+                        consumed += 1;
+                    }
+                }
+                consumed
+            }));
+        }
+        let mut total = 0u64;
+        for h in handles {
+            total += h.await.unwrap();
+        }
+        assert_eq!(total, 10_000);
+        assert_eq!(b.available(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_refill_concurrent() {
+        let b = TokenBucket::new(1000, 1000);
+        let _ = b.try_consume(1000);
+        assert_eq!(b.available(), 0);
+
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let b = b.clone();
+            handles.push(tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let mut consumed = 0u64;
+                while b.try_consume(10) {
+                    consumed += 1;
+                }
+                consumed
+            }));
+        }
+
+        let mut total = 0u64;
+        for h in handles {
+            total += h.await.unwrap();
+        }
+
+        assert!(total > 0, "should have consumed some tokens after refill");
+        assert!(b.available() <= 1000, "tokens must never exceed max");
     }
 }

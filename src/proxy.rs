@@ -1428,6 +1428,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_plain_proxy_upstream_bandwidth_error() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        let data = b"hello upstream";
+        wiremock::Mock::given(method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-length", data.len().to_string())
+                    .set_body_bytes(data),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let upstream_bucket = TokenBucket::new(0, 0);
+        let result = plain_proxy(&client, &format!("{}/test", server.uri()), &upstream_bucket).await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        use futures_util::TryStreamExt;
+        let body_result = resp.into_body().into_data_stream().try_collect::<Vec<_>>().await;
+        assert!(body_result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_throttled_stream_cancel_stops() {
         let data = vec![Ok(bytes::Bytes::from_static(b"data"))];
         let inner = futures_util::stream::iter(data);
