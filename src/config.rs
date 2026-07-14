@@ -2,6 +2,95 @@ use anyhow::Context;
 use clap::Parser;
 use std::path::PathBuf;
 
+/// Parse a human-readable byte value like `2K`, `10M`, `1G`, `500KB`.
+///
+/// Binary suffixes (×1024): `K`, `M`, `G`, `T`, `P`
+/// Decimal suffixes (×1000): `KB`, `MB`, `GB`, `TB`, `PB`
+/// Plain numbers without suffix are treated as bytes.
+/// Whitespace between number and suffix is allowed (`2 M`).
+/// Case-insensitive.
+pub fn parse_bytes(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty string");
+    }
+
+    // Split into numeric prefix and optional suffix
+    let split_pos = s.find(|c: char| !c.is_ascii_digit());
+    let (num_part, suffix) = if let Some(pos) = split_pos {
+        (&s[..pos], s[pos..].trim())
+    } else {
+        (s, "")
+    };
+
+    let base: u64 = num_part
+        .parse()
+        .with_context(|| format!("invalid number '{num_part}'"))?;
+
+    if suffix.is_empty() {
+        return Ok(base);
+    }
+
+    let multiplier: u64 = match suffix.to_ascii_lowercase().as_str() {
+        "kb" => 1_000,
+        "mb" => 1_000 * 1_000,
+        "gb" => 1_000 * 1_000 * 1_000,
+        "tb" => 1_000u64 * 1_000 * 1_000 * 1_000,
+        "pb" => 1_000u64 * 1_000 * 1_000 * 1_000 * 1_000,
+        "k" => 1024,
+        "m" => 1024 * 1024,
+        "g" => 1024 * 1024 * 1024,
+        "t" => 1024u64 * 1024 * 1024 * 1024,
+        "p" => 1024u64 * 1024 * 1024 * 1024 * 1024,
+        _ => anyhow::bail!("unknown suffix '{suffix}', expected K/KB/M/MB/G/GB/T/TB/P/PB"),
+    };
+
+    base.checked_mul(multiplier)
+        .with_context(|| format!("value too large: {base} × {multiplier}"))
+}
+
+/// Clap value_parser wrapper — converts `anyhow::Result` to `Result<_, String>`.
+fn parse_bytes_value(s: &str) -> Result<u64, String> {
+    parse_bytes(s).map_err(|e| e.to_string())
+}
+
+/// Serde helper: deserialize `Option<u64>` from either a YAML number or a
+/// string with human-readable byte suffix (`"1G"`, `"10MB"`, etc.).
+mod serde_bytes_option {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Num(u64),
+            Str(String),
+        }
+
+        match Option::<Raw>::deserialize(deserializer)? {
+            Some(Raw::Num(n)) => Ok(Some(n)),
+            Some(Raw::Str(s)) => {
+                super::parse_bytes(&s).map(Some).map_err(serde::de::Error::custom)
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn serialize<S>(val: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match val {
+            Some(n) => serializer.serialize_some(n),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
 /// Type of upstream proxy
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProxyType {
@@ -118,6 +207,7 @@ struct YamlConfig {
     bind: Option<String>,
     connections: Option<usize>,
     cache_dir: Option<PathBuf>,
+    #[serde(default, with = "serde_bytes_option")]
     max_cache_size: Option<u64>,
     url_map: Option<Vec<String>>,
     upstream_proxy: Option<String>,
@@ -125,7 +215,9 @@ struct YamlConfig {
     max_connections_per_ip: Option<usize>,
     max_total_connections: Option<usize>,
     max_workers: Option<usize>,
+    #[serde(default, with = "serde_bytes_option")]
     upstream_bandwidth: Option<u64>,
+    #[serde(default, with = "serde_bytes_option")]
     per_ip_bandwidth: Option<u64>,
 }
 
@@ -147,7 +239,8 @@ struct Cli {
     #[arg(long, default_value = "/var/cache/apt-blitz", env = "PROXY_CACHE_DIR")]
     cache_dir: PathBuf,
 
-    #[arg(long, default_value_t = 1_073_741_824, env = "PROXY_MAX_CACHE_SIZE")]
+    #[arg(long, default_value = "1073741824", env = "PROXY_MAX_CACHE_SIZE",
+          value_parser = parse_bytes_value)]
     max_cache_size: u64,
 
     /// Explicit config file path. When unset, auto‑discovery is used.
@@ -178,12 +271,14 @@ struct Cli {
     #[arg(long, default_value_t = 0, env = "PROXY_MAX_WORKERS")]
     max_workers: usize,
 
-    /// Global upstream bandwidth limit in bytes/sec (0 = unlimited)
-    #[arg(long, default_value_t = 0, env = "PROXY_UPSTREAM_BANDWIDTH")]
+    /// Global upstream bandwidth limit (bytes/sec, supports K/M/G/T suffixes, 0 = unlimited)
+    #[arg(long, default_value = "0", env = "PROXY_UPSTREAM_BANDWIDTH",
+          value_parser = parse_bytes_value)]
     upstream_bandwidth: u64,
 
-    /// Per-IP bandwidth limit in bytes/sec (0 = unlimited)
-    #[arg(long, default_value_t = 0, env = "PROXY_PER_IP_BANDWIDTH")]
+    /// Per-IP bandwidth limit (bytes/sec, supports K/M/G/T suffixes, 0 = unlimited)
+    #[arg(long, default_value = "0", env = "PROXY_PER_IP_BANDWIDTH",
+          value_parser = parse_bytes_value)]
     per_ip_bandwidth: u64,
 }
 
@@ -661,5 +756,105 @@ no_proxy:
 
         std::env::remove_var("PROXY_PORT");
         std::env::remove_var("PROXY_BIND");
+    }
+
+    #[test]
+    fn test_parse_bytes_decimal() {
+        assert_eq!(parse_bytes("100").unwrap(), 100);
+        assert_eq!(parse_bytes("1K").unwrap(), 1024);
+        assert_eq!(parse_bytes("10K").unwrap(), 10_240);
+        assert_eq!(parse_bytes("1M").unwrap(), 1_048_576);
+        assert_eq!(parse_bytes("100M").unwrap(), 104_857_600);
+        assert_eq!(parse_bytes("1G").unwrap(), 1_073_741_824);
+        assert_eq!(parse_bytes("2G").unwrap(), 2_147_483_648);
+        assert_eq!(parse_bytes("1T").unwrap(), 1_099_511_627_776);
+        assert_eq!(parse_bytes("1P").unwrap(), 1_125_899_906_842_624);
+    }
+
+    #[test]
+    fn test_parse_bytes_decimal_suffix() {
+        assert_eq!(parse_bytes("1KB").unwrap(), 1000);
+        assert_eq!(parse_bytes("1MB").unwrap(), 1_000_000);
+        assert_eq!(parse_bytes("1GB").unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn test_parse_bytes_case_insensitive() {
+        assert_eq!(parse_bytes("1k").unwrap(), 1024);
+        assert_eq!(parse_bytes("1K").unwrap(), 1024);
+        assert_eq!(parse_bytes("1kb").unwrap(), 1000);
+        assert_eq!(parse_bytes("1Mb").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn test_parse_bytes_with_whitespace() {
+        assert_eq!(parse_bytes(" 1G ").unwrap(), 1_073_741_824);
+        assert_eq!(parse_bytes("2 M").unwrap(), 2_097_152);
+    }
+
+    #[test]
+    fn test_parse_bytes_overflow() {
+        assert!(parse_bytes("999999999999999999T").is_err());
+    }
+
+    #[test]
+    fn test_parse_bytes_invalid() {
+        assert!(parse_bytes("").is_err());
+        assert!(parse_bytes("abc").is_err());
+        assert!(parse_bytes("1X").is_err());
+    }
+
+    #[test]
+    fn test_parse_bytes_value_clap() {
+        assert_eq!(parse_bytes_value("1G").unwrap(), 1_073_741_824);
+        assert!(parse_bytes_value("abc").is_err());
+    }
+
+    #[test]
+    fn test_serde_bytes_option_number() {
+        #[derive(serde::Deserialize, Debug)]
+        struct TestConfig {
+            #[serde(with = "serde_bytes_option")]
+            val: Option<u64>,
+        }
+
+        let c: TestConfig = serde_json::from_str(r#"{"val": 1024}"#).unwrap();
+        assert_eq!(c.val, Some(1024));
+    }
+
+    #[test]
+    fn test_serde_bytes_option_string() {
+        #[derive(serde::Deserialize, Debug)]
+        struct TestConfig {
+            #[serde(with = "serde_bytes_option")]
+            val: Option<u64>,
+        }
+
+        let c: TestConfig = serde_json::from_str(r#"{"val": "1G"}"#).unwrap();
+        assert_eq!(c.val, Some(1_073_741_824));
+    }
+
+    #[test]
+    fn test_serde_bytes_option_null() {
+        #[derive(serde::Deserialize, Debug)]
+        struct TestConfig {
+            #[serde(with = "serde_bytes_option", default)]
+            val: Option<u64>,
+        }
+
+        let c: TestConfig = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(c.val, None);
+    }
+
+    #[test]
+    fn test_serde_bytes_option_invalid_string() {
+        #[derive(serde::Deserialize, Debug)]
+        struct TestConfig {
+            #[serde(with = "serde_bytes_option")]
+            val: Option<u64>,
+        }
+
+        let c = serde_json::from_str::<TestConfig>(r#"{"val": "abc"}"#);
+        assert!(c.is_err());
     }
 }

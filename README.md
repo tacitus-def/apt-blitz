@@ -12,6 +12,8 @@ Inspired by `apt-cacher-ng` and `aria2` — combines request coalescing, range-b
 - **CONNECT tunnel** — Handles `CONNECT` for HTTPS, SOCKS5, and arbitrary TCP tunnels. Supports upstream HTTP/SOCKS5 proxy chaining and `NO_PROXY` bypass.
 - **SQLite disk cache** — WAL mode, LRU eviction by `last_access`. Stores response headers alongside cached files.
 - **Plain proxy fallback** — Falls back to single-stream proxy for files without `Accept-Ranges: bytes`, or when multithreaded download fails.
+- **Bandwidth limiting** — Per-IP (`--per-ip-bandwidth`) and global upstream (`--upstream-bandwidth`) bandwidth caps in bytes/sec. Uses token bucket algorithm with adaptive refill; excess data is buffered until tokens become available.
+- **Concurrency limits** — Per-IP (`--max-connections-per-ip`) and global (`--max-total-connections`) connection caps, plus worker thread limit (`--max-workers`). Returns `429 Too Many Requests` when exceeded.
 - **URL mapping** — Map fake hosts to real upstream URLs to cache HTTPS content through the proxy.
 - **Upstream proxy chain** — Route through another HTTP, HTTPS, or SOCKS5 proxy with optional authentication.
 - **YAML configuration** — Config file auto-discovery (`apt-blitz.yaml`, `~/.config/apt-blitz/config.yaml`, `/etc/apt-blitz/`) with CLI/env override hierarchy.
@@ -49,14 +51,29 @@ All options can be set via CLI flags or environment variables. A YAML config fil
 | Flag | Env | Default | Description |
 |------|-----|---------|-------------|
 | `--port` | `PROXY_PORT` | `8080` | Listen port |
-| `--bind` | `PROXY_BIND` | `0.0.0.0` | Bind address |
+| `--bind` | `PROXY_BIND` | `127.0.0.1` | Bind address |
 | `--connections` | `PROXY_CONNECTIONS` | `4` | Parallel connections per download |
 | `--cache-dir` | `PROXY_CACHE_DIR` | `/var/cache/apt-blitz` | Cache directory |
-| `--max-cache-size` | `PROXY_MAX_CACHE_SIZE` | `1073741824` (1 GiB) | Maximum cache size |
+| `--max-cache-size` | `PROXY_MAX_CACHE_SIZE` | `1073741824` (1 GiB) | Maximum cache size (supports `K`/`M`/`G`/`T`/`P` suffixes) |
 | `--url-map` | `PROXY_URL_MAP` | — | Fake-host to real-base mapping (`fake-apt=https://real.example.com`), repeatable or comma-separated |
 | `--upstream-proxy` | `PROXY_UPSTREAM_PROXY` | — | Upstream proxy URL (`http://proxy:3128`, `socks5://host:1080`) |
 | `--no-proxy` | `PROXY_NO_PROXY` | — | Bypass upstream proxy for these hosts (supports `*`, suffix `.local`, CIDR) |
 | `--config-file` | `PROXY_CONFIG_FILE` | — | Explicit YAML config path |
+
+**Bandwidth limiting** (bytes/sec, 0 = unlimited, supports `K`/`M`/`G`/`T`/`P` suffixes):
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--upstream-bandwidth` | `PROXY_UPSTREAM_BANDWIDTH` | `0` | Global upstream bandwidth limit — throttles all download workers combined |
+| `--per-ip-bandwidth` | `PROXY_PER_IP_BANDWIDTH` | `0` | Per-IP bandwidth limit — throttles each client's response stream independently |
+
+**Concurrency limits** (0 = unlimited):
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--max-connections-per-ip` | `PROXY_MAX_CONNECTIONS_PER_IP` | `4` | Max concurrent downloads per client IP |
+| `--max-total-connections` | `PROXY_MAX_TOTAL_CONNECTIONS` | `0` | Max total concurrent connections across all IPs |
+| `--max-workers` | `PROXY_MAX_WORKERS` | `0` | Max worker threads across all concurrent downloads |
 
 ```bash
 # All environment variables
@@ -69,10 +86,10 @@ PROXY_PORT=3128 PROXY_CACHE_DIR=/tmp/cache PROXY_UPSTREAM_PROXY=socks5://10.0.0.
 ```yaml
 # apt-blitz.yaml
 port: 8080
-bind: "0.0.0.0"
+bind: "127.0.0.1"
 connections: 8
 cache_dir: "/var/cache/apt-blitz"
-max_cache_size: 4294967296
+max_cache_size: 4G
 url_map:
   - "deb=https://deb.debian.org"
   - "sec=https://security.debian.org"
@@ -80,6 +97,11 @@ upstream_proxy: "http://10.0.0.1:3128"
 no_proxy:
   - ".local"
   - "10.0.0.0/8"
+max_connections_per_ip: 4
+max_total_connections: 0
+max_workers: 0
+upstream_bandwidth: 50M
+per_ip_bandwidth: 10M
 ```
 
 Auto-discovery locations (in order):
@@ -127,15 +149,16 @@ Auto-discovery locations (in order):
 ### Request flow
 
 1. **TCP accept + peek** — First 7 bytes are peeked; if `CONNECT`, the request is handled by `handle_connect_tunnel` (direct, SOCKS5, or HTTP proxy upstream). Otherwise, the connection is upgraded to HTTP/1.1 and forwarded to the axum router.
-2. **URL resolution** — If the URL matches a `fake-host` prefix from `--url-map`, it is rewritten to the real upstream base URL (allows caching HTTPS content via the proxy).
-3. **Cache lookup** — SQLite check by SHA-256 URL hash; if present and the file exists on disk, it is served directly.
-4. **Coalescer** — If another client is already fetching the same URL, join as follower reading the shared `SegmentsBuffer`. Otherwise become leader.
-5. **HEAD probe** — Leader sends HEAD to upstream to check `Content-Length` and `Accept-Ranges`.
-6. **Decision** — Files with `Accept-Ranges: bytes` and a known `Content-Length` get multithreaded download; everything else falls through to plain proxy.
-7. **Multithreaded** — Leader creates a pre-allocated temp file, spawns N workers that claim byte ranges atomically (CAS), download via ranged GETs, write via `pwrite(2)`, and mark segments ready. Segment size adapts per-worker based on throughput.
-8. **Fallback** — If the multithreaded download fails (e.g. server doesn't support ranges as advertised), the leader falls back to a plain `GET` into the same buffer.
-9. **Streaming** — Leader and follower(s) stream the temp file to their clients via `pread(2)`. Throttle (24 KiB chunks) applies until all segments complete; afterwards the full remaining data is sent without pacing.
-10. **Caching** — On success, the temp file is renamed into the cache directory (sharded by hash prefix) and indexed in SQLite with stored response headers. On failure, the temp file is deleted.
+2. **Concurrency limit** — Per-IP semaphore (`--max-connections-per-ip`) and global semaphore (`--max-total-connections`) are acquired. If limits are exceeded, the client receives `429 Too Many Requests`.
+3. **URL resolution** — If the URL matches a `fake-host` prefix from `--url-map`, it is rewritten to the real upstream base URL (allows caching HTTPS content via the proxy).
+4. **Cache lookup** — SQLite check by SHA-256 URL hash; if present and the file exists on disk, it is served directly.
+5. **Coalescer** — If another client is already fetching the same URL, join as follower reading the shared `SegmentsBuffer`. Otherwise become leader.
+6. **HEAD probe** — Leader sends HEAD to upstream to check `Content-Length` and `Accept-Ranges`.
+7. **Decision** — Files with `Accept-Ranges: bytes` and a known `Content-Length` get multithreaded download; everything else falls through to plain proxy.
+8. **Multithreaded** — Leader creates a pre-allocated temp file, spawns N workers that claim byte ranges atomically (CAS), download via ranged GETs, write via `pwrite(2)`, and mark segments ready. Each worker checks the global upstream bucket (`--upstream-bandwidth`) before writing; if tokens are unavailable, it waits until refill. Segment size adapts per-worker based on throughput.
+9. **Fallback** — If the multithreaded download fails (e.g. server doesn't support ranges as advertised), the leader falls back to a plain `GET` into the same buffer. Upstream bandwidth is enforced on each chunk.
+10. **Streaming to client** — Leader and follower(s) stream the temp file to their clients via `pread(2)`. If `--per-ip-bandwidth` is set, a per-IP token bucket throttles the response body stream — chunks that exceed the bucket capacity are split and delivered as tokens become available. Throttle (24 KiB chunks) applies until all segments complete; afterwards the full remaining data is sent without pacing.
+11. **Caching** — On success, the temp file is renamed into the cache directory (sharded by hash prefix) and indexed in SQLite with stored response headers. On failure, the temp file is deleted.
 
 ### CONNECT tunnel variants
 
@@ -154,7 +177,8 @@ Auto-discovery locations (in order):
 | `proxy` | `src/proxy.rs` | HTTP handler, CONNECT tunnel, FTP proxy, request routing, stream construction, cache serving, URL resolution |
 | `buffer` | `src/buffer.rs` | `SegmentsBuffer` — thread-safe shared buffer with CAS range claiming, per-segment Mutex, broadcast channel for readiness, `pwrite`/`pread` I/O |
 | `coalescer` | `src/coalescer.rs` | In-flight request deduplication via oneshot channels; `Pending` → `Downloading` state machine |
-| `downloader` | `src/downloader.rs` | N parallel HTTP range workers with adaptive segment sizing (64 K–4 M), cancellation token |
+| `downloader` | `src/downloader.rs` | N parallel HTTP range workers with adaptive segment sizing (64 K–4 M), cancellation token |
+| `rate_limit` | `src/rate_limit.rs` | `TokenBucket` (atomic refill + CAS), `IpRateLimiter` (per-IP concurrency + bandwidth), `WorkerLimiter` (global worker cap), `IpPermit` (held permits with bucket) |
 | `ftp` | `src/ftp.rs` | FTP protocol (`PASV`, `SIZE`, `REST`, `RETR`), single + multithreaded download, URL parsing |
 | `cache` | `src/cache.rs` | SQLite-backed disk cache, WAL mode, LRU eviction, header serialization |
 | `config` | `src/config.rs` | Clap-derived config with YAML/ENV/CLI hierarchy, `UrlMap`, `UpstreamProxy`, auto-discovery |

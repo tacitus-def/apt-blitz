@@ -1,7 +1,7 @@
 .\" Man page for apt-blitz
 .\" Generated from source; do not edit manually.
 .\"
-.TH APT-BLITZ 1 "2026-07-04" "0.1.2" "User Commands"
+.TH APT-BLITZ 1 "2026-07-04" "0.2.0" "User Commands"
 .SH NAME
 apt-blitz \- multithreaded proxy for APT-like package managers
 .SH SYNOPSIS
@@ -21,7 +21,11 @@ Transparent caching via SQLite with WAL mode
 .IP \(bu 3
 FTP and FTPS protocol support
 .IP \(bu 3
-In-flight request coalescing (deduplication)
+In\-flight request coalescing (deduplication)
+.IP \(bu 3
+Bandwidth limiting: per\-IP and global upstream caps (token bucket)
+.IP \(bu 3
+Concurrency limits: per\-IP and global connection caps, worker limit
 .IP \(bu 3
 YAML configuration file support
 .IP \(bu 3
@@ -59,7 +63,11 @@ Default: \fB/var/cache/apt-blitz\fR
 Env: \fBPROXY_CACHE_DIR\fR
 .TP
 .B \-\-max\-cache\-size \fI\,BYTES\/\fR
-Maximum cache size in bytes (LRU eviction).
+Maximum cache size (LRU eviction).
+Supports binary suffixes: \fBK\fR (1024), \fBM\fR (1024²),
+\fBG\fR (1024³), \fBT\fR (1024⁴), \fBP\fR (1024⁵);
+decimal suffixes: \fBKB\fR, \fBMB\fR, \fBGB\fR, \fBTB\fR, \fBPB\fR.
+Also accepts plain numbers.
 .br
 Default: \fB1073741824\fR (1 GiB)
 .br
@@ -92,10 +100,64 @@ Example: \fBhttp://10.0.0.1:3128\fR
 Env: \fBPROXY_UPSTREAM_PROXY\fR
 .TP
 .B \-\-no\-proxy \fI\,HOSTS\/\fR
-Comma-separated list of hosts that bypass the upstream proxy.
+Comma\-separated list of hosts that bypass the upstream proxy.
 Accepts domain suffixes (e.g. \fB.local\fR) and CIDR subnets.
 .br
 Env: \fBPROXY_NO_PROXY\fR
+.TP
+.B \-\-max\-connections\-per\-ip \fI\,COUNT\/\fR
+Maximum concurrent downloads per client IP.
+Set to \fB0\fR for unlimited.
+.br
+Default: \fB4\fR
+.br
+Env: \fBPROXY_MAX_CONNECTIONS_PER_IP\fR
+.TP
+.B \-\-max\-total\-connections \fI\,COUNT\/\fR
+Maximum total concurrent connections across all client IPs.
+Set to \fB0\fR for unlimited.
+.br
+Default: \fB0\fR
+.br
+Env: \fBPROXY_MAX_TOTAL_CONNECTIONS\fR
+.TP
+.B \-\-max\-workers \fI\,COUNT\/\fR
+Maximum total worker threads across all concurrent downloads.
+Set to \fB0\fR for unlimited.
+.br
+Default: \fB0\fR
+.br
+Env: \fBPROXY_MAX_WORKERS\fR
+.TP
+.B \-\-upstream\-bandwidth \fI\,BYTES\/\fR
+Global upstream bandwidth limit (bytes/sec).
+Supports binary suffixes: \fBK\fR (1024), \fBM\fR (1024²),
+\fBG\fR (1024³), \fBT\fR (1024⁴), \fBP\fR (1024⁵);
+decimal suffixes: \fBKB\fR, \fBMB\fR, \fBGB\fR, \fBTB\fR, \fBPB\fR.
+Also accepts plain numbers.
+Applied to all download workers combined.
+When the bucket is empty, workers wait until tokens refill
+before writing the next chunk.
+Set to \fB0\fR for unlimited.
+.br
+Default: \fB0\fR
+.br
+Env: \fBPROXY_UPSTREAM_BANDWIDTH\fR
+.TP
+.B \-\-per\-ip\-bandwidth \fI\,BYTES\/\fR
+Per\-IP bandwidth limit (bytes/sec) on the response stream.
+Supports binary suffixes: \fBK\fR (1024), \fBM\fR (1024²),
+\fBG\fR (1024³), \fBT\fR (1024⁴), \fBP\fR (1024⁵);
+decimal suffixes: \fBKB\fR, \fBMB\fR, \fBGB\fR, \fBTB\fR, \fBPB\fR.
+Also accepts plain numbers.
+Each client connection has its own token bucket;
+chunks exceeding the bucket are split and delivered
+as tokens become available.
+Set to \fB0\fR for unlimited.
+.br
+Default: \fB0\fR
+.br
+Env: \fBPROXY_PER_IP_BANDWIDTH\fR
 .TP
 .B \-h, \-\-help
 Print help message and exit.
@@ -131,7 +193,22 @@ Equivalent to \fB\-\-url\-map\fR (comma-separated).
 Equivalent to \fB\-\-upstream\-proxy\fR.
 .TP
 .B PROXY_NO_PROXY
-Equivalent to \fB\-\-no\-proxy\fR (comma-separated).
+Equivalent to \fB\-\-no\-proxy\fR (comma\-separated).
+.TP
+.B PROXY_MAX_CONNECTIONS_PER_IP
+Equivalent to \fB\-\-max\-connections\-per\-ip\fR.
+.TP
+.B PROXY_MAX_TOTAL_CONNECTIONS
+Equivalent to \fB\-\-max\-total\-connections\fR.
+.TP
+.B PROXY_MAX_WORKERS
+Equivalent to \fB\-\-max\-workers\fR.
+.TP
+.B PROXY_UPSTREAM_BANDWIDTH
+Equivalent to \fB\-\-upstream\-bandwidth\fR.
+.TP
+.B PROXY_PER_IP_BANDWIDTH
+Equivalent to \fB\-\-per\-ip\-bandwidth\fR.
 .SH FILES
 .TP
 .I apt-blitz.yaml, apt-blitz.yml
@@ -153,13 +230,18 @@ port: 8080
 bind: "127.0.0.1"
 connections: 8
 cache_dir: "/var/cache/apt-blitz"
-max_cache_size: 5368709120
+max_cache_size: 5G
 url_map:
   \- fake-debian=https://deb.debian.org
 upstream_proxy: "http://10.0.0.1:3128"
 no_proxy:
   \- .local
   \- 10.0.0.0/8
+max_connections_per_ip: 4
+max_total_connections: 0
+max_workers: 0
+upstream_bandwidth: 50M
+per_ip_bandwidth: 10M
 .RE
 .fi
 .SH AUTHORS
