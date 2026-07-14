@@ -1,3 +1,10 @@
+apt-blitz (0.3.0-1) unstable; urgency=medium
+
+  * Support human-readable byte values for cache size and bandwidth args.
+  * Separate bandwidth limiting from concurrency limits in documentation.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 14 Jul 2026 00:00:00 +0300
+
 apt-blitz (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
