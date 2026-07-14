@@ -1,3 +1,9 @@
+apt-blitz (0.4.0-1) unstable; urgency=medium
+
+  * Add request tracing with per-request ID and spans.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 14 Jul 2026 00:00:00 +0300
+
 apt-blitz (0.3.1-1) unstable; urgency=medium
 
   * Change default max-connections-per-ip to 0 (unlimited).
