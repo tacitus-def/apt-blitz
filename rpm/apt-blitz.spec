@@ -29,7 +29,7 @@ Features:
 %setup -q -n %{name}-%{version}
 
 %build
-cargo build --release --frozen
+cargo build --release --offline
 
 %install
 install -D -m 0755 target/release/apt-blitz %{buildroot}%{_bindir}/apt-blitz
