@@ -97,6 +97,20 @@ impl TokenBucket {
         self.inner.tokens.load(Ordering::Relaxed)
     }
 
+    /// Estimate nanoseconds until `amount` tokens become available via refill.
+    /// Returns 0 if tokens are already available or bucket is unlimited.
+    pub fn wait_time_nanos(&self, amount: u64) -> u64 {
+        if self.inner.max_tokens == u64::MAX && self.inner.refill_rate_nanos == 0 {
+            return 0;
+        }
+        let avail = self.available();
+        if avail >= amount {
+            return 0;
+        }
+        let deficit = amount - avail;
+        deficit * self.inner.refill_rate_nanos
+    }
+
     /// Consume `bytes` tokens, sleeping until available or cancelled.
     /// Returns `true` if consumed, `false` if cancelled.
     pub async fn wait_consume(&self, bytes: u64, cancel: &CancellationToken) -> bool {
@@ -145,8 +159,8 @@ impl TokenBucketInner {
 }
 
 pub struct IpPermit {
-    _global: OwnedSemaphorePermit,
-    _per_ip: Option<OwnedSemaphorePermit>,
+    pub(crate) _global: OwnedSemaphorePermit,
+    pub(crate) _per_ip: Option<OwnedSemaphorePermit>,
     pub per_ip_bucket: Option<TokenBucket>,
 }
 
@@ -322,5 +336,25 @@ mod tests {
         drop(p1);
         assert!(limiter.try_acquire().is_some());
         drop(p2);
+    }
+
+    #[test]
+    fn test_wait_time_nanos_unlimited() {
+        let b = TokenBucket::unlimited();
+        assert_eq!(b.wait_time_nanos(1000), 0);
+    }
+
+    #[test]
+    fn test_wait_time_nanos_enough_tokens() {
+        let b = TokenBucket::new(1000, 100);
+        assert_eq!(b.wait_time_nanos(500), 0);
+    }
+
+    #[test]
+    fn test_wait_time_nanos_needs_refill() {
+        let b = TokenBucket::new(1000, 100);
+        let _ = b.try_consume(1000);
+        let wait = b.wait_time_nanos(500);
+        assert!(wait > 0);
     }
 }

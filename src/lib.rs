@@ -30,6 +30,7 @@ use crate::coalescer::Coalescer;
 use crate::config::{Config, ProxyType};
 use crate::proxy::{handle_connect_tunnel, handle_proxy, AppState};
 use crate::rate_limit::{IpRateLimiter, TokenBucket, WorkerLimiter};
+use tokio_util::sync::CancellationToken;
 
 pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
     info!(%config, "starting apt-blitz");
@@ -96,6 +97,7 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
         } else {
             TokenBucket::new(config.upstream_bandwidth, config.upstream_bandwidth)
         }),
+        cancel: CancellationToken::new(),
     };
 
     let router = build_app(state);

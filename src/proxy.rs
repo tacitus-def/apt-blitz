@@ -8,10 +8,12 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::buffer::SegmentsBuffer;
@@ -161,6 +163,7 @@ pub struct AppState {
     pub ip_limiter: Arc<IpRateLimiter>,
     pub worker_limiter: Arc<WorkerLimiter>,
     pub upstream_bucket: Arc<TokenBucket>,
+    pub cancel: CancellationToken,
 }
 
 impl AppState {
@@ -187,6 +190,7 @@ impl AppState {
             } else {
                 TokenBucket::new(config.upstream_bandwidth, config.upstream_bandwidth)
             }),
+            cancel: CancellationToken::new(),
         }
     }
 }
@@ -223,29 +227,116 @@ impl From<reqwest::Error> for ProxyError {
     }
 }
 
-struct HoldPermitStream<S> {
+struct ThrottledPermitStream<S> {
     inner: S,
     _permit: IpPermit,
+    bucket: Option<TokenBucket>,
+    cancel: CancellationToken,
+    state: ThrottleState,
+    timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    data: Option<bytes::Bytes>,
 }
 
-impl<S> futures_util::Stream for HoldPermitStream<S>
+enum ThrottleState {
+    Idle,
+    Waiting,
+}
+
+impl<S> futures_util::Stream for ThrottledPermitStream<S>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
 {
     type Item = Result<bytes::Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        if self.cancel.is_cancelled() {
+            return Poll::Ready(None);
+        }
+
+        match self.state {
+            ThrottleState::Idle => {
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(None) => Poll::Ready(None),
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        if let Some(ref bucket) = self.bucket {
+                            let len = chunk.len() as u64;
+                            if bucket.try_consume(len) {
+                                Poll::Ready(Some(Ok(chunk)))
+                            } else {
+                                self.data = Some(chunk);
+                                self.state = ThrottleState::Waiting;
+                                self.schedule_wake(cx);
+                                Poll::Pending
+                            }
+                        } else {
+                            Poll::Ready(Some(Ok(chunk)))
+                        }
+                    }
+                }
+            }
+            ThrottleState::Waiting => {
+                if let Some(ref mut timer) = self.timer {
+                    if timer.poll_unpin(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+                self.timer = None;
+                self.state = ThrottleState::Idle;
+
+                if let Some(chunk) = self.data.take() {
+                    if let Some(ref bucket) = self.bucket {
+                        let len = chunk.len() as u64;
+                        if bucket.try_consume(len) {
+                            return Poll::Ready(Some(Ok(chunk)));
+                        }
+                        self.data = Some(chunk);
+                        self.state = ThrottleState::Waiting;
+                        self.schedule_wake(cx);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Some(Ok(chunk)))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
     }
 }
 
-fn wrap_response_with_permit(resp: Response, permit: IpPermit) -> Response {
+impl<S> ThrottledPermitStream<S> {
+    fn schedule_wake(&mut self, cx: &mut Context<'_>) {
+        if let Some(ref bucket) = self.bucket {
+            let remaining = self.data.as_ref().map(|d| d.len() as u64).unwrap_or(0);
+            if remaining == 0 {
+                return;
+            }
+            let wait_nanos = bucket.wait_time_nanos(remaining);
+            let ms = if wait_nanos == 0 {
+                1
+            } else {
+                (wait_nanos / 1_000_000).max(1)
+            };
+            self.timer = Some(Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+            let _ = self.timer.as_mut().unwrap().poll_unpin(cx);
+        }
+    }
+}
+
+fn wrap_response_with_permit(resp: Response, permit: IpPermit, cancel: CancellationToken) -> Response {
     let (parts, body) = resp.into_parts();
+    let per_ip_bucket = permit.per_ip_bucket.clone();
     let stream = body.into_data_stream();
     let mapped = stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
-    let wrapped = HoldPermitStream {
+    let wrapped = ThrottledPermitStream {
         inner: mapped,
         _permit: permit,
+        bucket: per_ip_bucket,
+        cancel,
+        state: ThrottleState::Idle,
+        timer: None,
+        data: None,
     };
     Response::from_parts(parts, Body::from_stream(wrapped))
 }
@@ -307,17 +398,17 @@ pub async fn handle_proxy(
 
     if url.starts_with("ftp://") || url.starts_with("ftps://") {
         let resp = handle_ftp_proxy(&url, &state).await?;
-        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
+        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
     match resolve_with_coalescing(&url, &state.cache, &state.coalescer).await? {
         CoalesceOutcome::Cached { path, headers } => {
             let resp = serve_file(&path, &headers).await?;
-            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         CoalesceOutcome::FollowerBuffer(buffer) => {
             let resp = serve_from_buffer(buffer, &url).await;
-            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         CoalesceOutcome::Leader => {}
     }
@@ -330,7 +421,7 @@ pub async fn handle_proxy(
         {
             state.coalescer.complete(&url);
             let resp = plain_proxy(&state.client, &url, &state.upstream_bucket).await?;
-            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         state.coalescer.complete(&url);
         head_resp.error_for_status().map_err(ProxyError::Upstream)?;
@@ -352,7 +443,7 @@ pub async fn handle_proxy(
         );
         state.coalescer.complete(&url);
         let resp = plain_proxy(&state.client, &url, &state.upstream_bucket).await?;
-        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()));
+        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
     let total_size = content_length.unwrap();
@@ -418,7 +509,7 @@ pub async fn handle_proxy(
     }
     let resp = resp_builder.body(Body::from_stream(stream)).unwrap();
 
-    Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap()))
+    Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()))
 }
 
 async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, ProxyError> {
@@ -1232,6 +1323,133 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].is_err());
         std::fs::remove_file(buffer.file_path()).ok();
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_no_bucket_passthrough() {
+        let data = vec![
+            Ok(bytes::Bytes::from_static(b"hello")),
+            Ok(bytes::Bytes::from_static(b" world")),
+        ];
+        let inner = futures_util::stream::iter(data);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: None,
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            data: None,
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].as_ref().unwrap().as_ref(), b"hello");
+        assert_eq!(result[1].as_ref().unwrap().as_ref(), b" world");
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_with_enough_tokens() {
+        let data = vec![
+            Ok(bytes::Bytes::from_static(b"abcdef")),
+        ];
+        let inner = futures_util::stream::iter(data);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(1000, 1000);
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            data: None,
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref().unwrap().as_ref(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_throttles_and_delivers() {
+        let chunk = bytes::Bytes::from_static(b"throttled data");
+        let inner = futures_util::stream::iter(vec![Ok(chunk.clone())]);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(100, 100);
+        let _ = bucket.try_consume(100);
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            data: None,
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref().unwrap().as_ref(), b"throttled data");
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_cancel_stops() {
+        let data = vec![Ok(bytes::Bytes::from_static(b"data"))];
+        let inner = futures_util::stream::iter(data);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(100, 100);
+        let _ = bucket.try_consume(100);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            data: None,
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert!(result.is_empty());
     }
 }
 
