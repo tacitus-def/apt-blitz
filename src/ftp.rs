@@ -253,6 +253,7 @@ pub async fn download_ftp_multithreaded(
     num_connections: usize,
     worker_limiter: &crate::rate_limit::WorkerLimiter,
     upstream_bucket: &crate::rate_limit::TokenBucket,
+    req_id: u64,
 ) -> Result<(), FtpDownloadError> {
     let cancel = CancellationToken::new();
     let mut handles = Vec::with_capacity(num_connections);
@@ -267,7 +268,7 @@ pub async fn download_ftp_multithreaded(
         let bucket = upstream_bucket.clone();
         handles.push(tokio::spawn(async move {
             let _permit = limiter.acquire().await;
-            ftp_worker(&url, buffer, child_token, i, &bucket).await
+            ftp_worker(&url, buffer, child_token, i, &bucket, req_id).await
         }));
     }
 
@@ -277,12 +278,12 @@ pub async fn download_ftp_multithreaded(
             Ok(Ok(())) => {}
             Ok(Err(FtpDownloadError::Cancelled)) => {}
             Ok(Err(e)) => {
-                error!(error = ?e, "ftp worker failed");
+                error!(req_id, error = ?e, "ftp worker failed");
                 errors.push(e);
                 cancel.cancel();
             }
             Err(e) => {
-                error!(error = ?e, "ftp worker panicked");
+                error!(req_id, error = ?e, "ftp worker panicked");
                 errors.push(FtpDownloadError::BufferFailed);
                 cancel.cancel();
             }
@@ -303,6 +304,7 @@ async fn ftp_worker(
     cancel: CancellationToken,
     worker_id: usize,
     upstream_bucket: &crate::rate_limit::TokenBucket,
+    req_id: u64,
 ) -> Result<(), FtpDownloadError> {
     let mut ftp = connect_and_login(url).await
         .map_err(|e| FtpDownloadError::Ftp(e.to_string()))?;
@@ -321,7 +323,7 @@ async fn ftp_worker(
         };
         let size = end - start;
 
-        info!(worker = worker_id, segment = id, start, size, "ftp downloading segment");
+        info!(req_id, worker = worker_id, segment = id, start, size, "ftp downloading segment");
 
         let start_time = Instant::now();
 
@@ -715,7 +717,7 @@ mod tests {
         let buffer = create_temp_buffer(file_size).await;
         let limiter = crate::rate_limit::WorkerLimiter::new(0);
         let bucket = crate::rate_limit::TokenBucket::unlimited();
-        download_ftp_multithreaded(&url, buffer.clone(), 4, &limiter, &bucket).await.unwrap();
+        download_ftp_multithreaded(&url, buffer.clone(), 4, &limiter, &bucket, 0).await.unwrap();
         assert!(buffer.all_completed());
         let read = buffer.read_data(0, file_size).unwrap();
         let expected: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();

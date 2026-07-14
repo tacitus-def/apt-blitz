@@ -50,6 +50,7 @@ pub async fn download_multithreaded(
     num_connections: usize,
     worker_limiter: &WorkerLimiter,
     upstream_bucket: &TokenBucket,
+    req_id: u64,
 ) -> Result<(), DownloadError> {
     let cancel = CancellationToken::new();
     let mut handles = Vec::with_capacity(num_connections);
@@ -65,7 +66,7 @@ pub async fn download_multithreaded(
         let limiter = worker_limiter.clone();
         handles.push(tokio::spawn(async move {
             let _permit = limiter.acquire().await;
-            download_worker(&client, &url, buffer, child_token, i, &bucket).await
+            download_worker(&client, &url, buffer, child_token, i, &bucket, req_id).await
         }));
     }
 
@@ -75,12 +76,12 @@ pub async fn download_multithreaded(
             Ok(Ok(())) => {}
             Ok(Err(DownloadError::Cancelled)) => {}
             Ok(Err(e)) => {
-                error!(error = ?e, "downloader worker failed");
+                error!(req_id, error = ?e, "downloader worker failed");
                 errors.push(e);
                 cancel.cancel();
             }
             Err(e) => {
-                error!(error = ?e, "downloader worker panicked");
+                error!(req_id, error = ?e, "downloader worker panicked");
                 errors.push(DownloadError::BufferFailed);
                 cancel.cancel();
             }
@@ -101,6 +102,7 @@ async fn download_worker(
     cancel: CancellationToken,
     worker_id: usize,
     upstream_bucket: &TokenBucket,
+    req_id: u64,
 ) -> Result<(), DownloadError> {
     let mut preferred_size = INITIAL_SEGMENT_SIZE;
 
@@ -119,6 +121,7 @@ async fn download_worker(
 
         let range_header = format!("bytes={}-{}", start, end - 1);
         info!(
+            req_id,
             worker = worker_id,
             segment = id,
             range = %range_header,
@@ -135,6 +138,7 @@ async fn download_worker(
         let status = response.status();
         if status != StatusCode::PARTIAL_CONTENT && status != StatusCode::OK {
             error!(
+                req_id,
                 worker = worker_id,
                 segment = id,
                 status = %status,
@@ -160,6 +164,7 @@ async fn download_worker(
 
         buffer.mark_ready(id);
         info!(
+            req_id,
             worker = worker_id,
             segment = id,
             size = size,
@@ -338,7 +343,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
         assert!(result.is_ok());
 
         assert!(buffer.all_completed());
@@ -375,7 +380,7 @@ mod tests {
 
         cancel.cancel();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
     }
 }
