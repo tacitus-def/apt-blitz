@@ -17,7 +17,7 @@ const MAX_SEGMENT_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 200;
 
 fn is_transient_error(e: &reqwest::Error) -> bool {
-    e.is_connect() || e.is_body() || e.is_timeout()
+    e.is_connect() || e.is_body() || e.is_timeout() || e.is_decode() || e.is_request()
 }
 
 fn next_segment_size(speed: f64) -> u64 {

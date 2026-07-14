@@ -148,6 +148,7 @@ async fn resolve_with_coalescing(
     url: &str,
     cache: &Cache,
     coalescer: &Coalescer,
+    failure_tracker: &FailureTracker,
     req_id: u64,
 ) -> Result<CoalesceOutcome, ProxyError> {
     let mut retries = 0u32;
@@ -156,6 +157,13 @@ async fn resolve_with_coalescing(
             return Err(ProxyError::Internal("too many retries waiting for in-flight download".into()));
         }
         retries += 1;
+
+        if failure_tracker.is_in_cooldown(url) {
+            warn!(req_id, url = %url, "upstream in failure cooldown, rejecting");
+            return Err(ProxyError::Internal(format!(
+                "upstream unstable for {}, retry later", url
+            )));
+        }
 
         if let Some((cached_path, cached_headers)) = cache.lookup(url).await {
             info!(req_id, path = %cached_path.display(), "cache hit");
@@ -536,15 +544,7 @@ async fn handle_proxy_inner(
         return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
-    if state.failure_tracker.is_in_cooldown(&url) {
-        warn!(req_id, url = %url, "upstream in failure cooldown, rejecting");
-        state.coalescer.complete(&url);
-        return Err(ProxyError::Internal(format!(
-            "upstream unstable for {}, retry later", url
-        )));
-    }
-
-    match resolve_with_coalescing(&url, &state.cache, &state.coalescer, req_id).await? {
+    match resolve_with_coalescing(&url, &state.cache, &state.coalescer, &state.failure_tracker, req_id).await? {
         CoalesceOutcome::Cached { path, headers } => {
             let resp = serve_file(&path, &headers).await?;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
@@ -664,7 +664,7 @@ async fn handle_proxy_inner(
 async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Response, ProxyError> {
     info!(req_id, "ftp request");
 
-    match resolve_with_coalescing(url, &state.cache, &state.coalescer, req_id).await? {
+    match resolve_with_coalescing(url, &state.cache, &state.coalescer, &state.failure_tracker, req_id).await? {
         CoalesceOutcome::Cached { path, headers } => {
             return serve_file(&path, &headers).await;
         }

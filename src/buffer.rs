@@ -71,6 +71,12 @@ impl SegmentsBuffer {
     }
 
     pub fn claim_range(&self, preferred_size: u64) -> Option<(usize, u64, u64)> {
+        if preferred_size == 0 {
+            if self.next_unassigned.load(Ordering::Acquire) >= self.total_size {
+                self.all_assigned.store(true, Ordering::Release);
+            }
+            return None;
+        }
         loop {
             let current = self.next_unassigned.load(Ordering::Acquire);
             if current >= self.total_size {
@@ -559,16 +565,9 @@ mod tests {
     async fn test_claim_range_preferred_size_zero() {
         let (file, path) = create_temp_file(100);
         let (buffer, rx) = SegmentsBuffer::new(100, file, path);
-        // preferred_size=0: should claim 0 bytes and advance to the same position
         let r = buffer.claim_range(0);
-        assert!(r.is_some());
-        let (id, start, end) = r.unwrap();
-        assert_eq!(id, 0);
-        assert_eq!(start, 0);
-        assert_eq!(end, 0); // zero-size segment
-        // next_unassigned stays at 0 because end == start
-        // Actually: end = current + size = 0 + 0 = 0, so next is still 0
-        // This creates an infinite loop in claim_range! But that's the current behavior.
+        assert!(r.is_none());
+        assert!(!buffer.all_assigned.load(Ordering::Acquire));
         drop(rx);
     }
 
