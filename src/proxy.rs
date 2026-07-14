@@ -476,7 +476,7 @@ pub async fn handle_proxy(
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         CoalesceOutcome::FollowerBuffer(buffer) => {
-            let resp = serve_from_buffer(buffer, &url).await;
+            let resp = serve_from_buffer(buffer).await;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         CoalesceOutcome::Leader => {}
@@ -571,7 +571,7 @@ pub async fn handle_proxy(
         state.coalescer.clone(),
     );
 
-    let stream = make_buffer_stream(buffer, notify_rx, &url);
+    let stream = make_buffer_stream(buffer, notify_rx);
     let mut resp_builder = Response::builder().status(resp_status);
     for (key, val) in &resp_headers {
         resp_builder = resp_builder.header(key, val);
@@ -589,7 +589,7 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
             return serve_file(&path, &headers).await;
         }
         CoalesceOutcome::FollowerBuffer(buffer) => {
-            return Ok(serve_from_buffer(buffer, url).await);
+            return Ok(serve_from_buffer(buffer).await);
         }
         CoalesceOutcome::Leader => {}
     }
@@ -645,7 +645,7 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
         state.coalescer.clone(),
     );
 
-    let stream = make_buffer_stream(buffer, notify_rx, url);
+    let stream = make_buffer_stream(buffer, notify_rx);
     let mut resp_builder = Response::builder().status(resp_status);
     for (key, val) in &resp_headers {
         resp_builder = resp_builder.header(key, val);
@@ -654,10 +654,10 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
     Ok(resp)
 }
 
-async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, url: &str) -> Response {
+async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>) -> Response {
     let meta = buffer.wait_meta().await;
     let rx = buffer.subscribe();
-    let stream = make_buffer_stream(buffer, rx, url);
+    let stream = make_buffer_stream(buffer, rx);
     let mut resp_builder = Response::builder().status(meta.0);
     for (key, val) in &meta.1 {
         resp_builder = resp_builder.header(key, val);
@@ -668,13 +668,10 @@ async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, url: &str) -> Response {
 fn make_buffer_stream(
     buffer: Arc<SegmentsBuffer>,
     notify_rx: broadcast::Receiver<usize>,
-    url: &str,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
-    let url = url.to_string();
     struct StreamState {
         buffer: Arc<SegmentsBuffer>,
         notify_rx: broadcast::Receiver<usize>,
-        url: String,
         current_segment: usize,
         offset_in_segment: u64,
         errored: bool,
@@ -683,7 +680,6 @@ fn make_buffer_stream(
     let initial = StreamState {
         buffer,
         notify_rx,
-        url,
         current_segment: 0,
         offset_in_segment: 0,
         errored: false,
@@ -1262,7 +1258,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/x");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1314,7 +1310,7 @@ mod tests {
         buffer.mark_ready(id2);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/y");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1352,7 +1348,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/z");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1388,7 +1384,7 @@ mod tests {
         buffer.set_failed();
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/fail");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<_> = futures_util::StreamExt::collect::<Vec<_>>(stream).await;
 
         assert_eq!(result.len(), 1);
