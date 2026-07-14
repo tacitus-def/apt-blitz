@@ -1,3 +1,13 @@
+apt-blitz (0.4.2-1) unstable; urgency=medium
+
+  * Fix is_transient_error to cover Decode and Request error kinds,
+    enabling proper retries for body stream and request send failures.
+  * Fix FailureTracker race by moving cooldown check into
+    resolve_with_coalescing retry loop.
+  * Fix claim_range(0) infinite loop by returning None for zero-size claims.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 14 Jul 2026 00:00:00 +0300
+
 apt-blitz (0.4.1-1) unstable; urgency=medium
 
   * Add segment-level retry with exponential backoff for transient network errors.
