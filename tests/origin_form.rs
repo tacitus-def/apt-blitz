@@ -1,10 +1,10 @@
 mod common;
 
+use common::parse_range;
+
 use std::sync::Arc;
 
 use apt_blitz::build_app;
-use apt_blitz::cache::Cache;
-use apt_blitz::coalescer::Coalescer;
 use apt_blitz::config::Config;
 use apt_blitz::proxy::AppState;
 use reqwest::Client;
@@ -62,6 +62,11 @@ async fn origin_form_single_file() {
         url_maps: vec![],
         upstream_proxy: None,
         no_proxy: vec![],
+        max_connections_per_ip: 0,
+        max_total_connections: 0,
+        max_workers: 0,
+        upstream_bandwidth: 0,
+        per_ip_bandwidth: 0,
     };
 
     let client = Client::builder()
@@ -69,17 +74,7 @@ async fn origin_form_single_file() {
         .build()
         .unwrap();
 
-    let cache = Cache::new(config.cache_dir.clone(), config.max_cache_size).unwrap();
-    let temp_dir = config.cache_dir.join("tmp");
-    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
-
-    let state = AppState {
-        client: client.clone(),
-        config: Arc::new(config),
-        cache,
-        coalescer: Arc::new(Coalescer::new()),
-        temp_dir,
-    };
+    let state = AppState::from_config(config, client.clone());
 
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -164,6 +159,11 @@ async fn origin_form_with_url_map() {
         url_maps: vec![apt_blitz::config::UrlMap::parse(&format!("mirror.example.com={}", upstream.uri())).unwrap()],
         upstream_proxy: None,
         no_proxy: vec![],
+        max_connections_per_ip: 0,
+        max_total_connections: 0,
+        max_workers: 0,
+        upstream_bandwidth: 0,
+        per_ip_bandwidth: 0,
     };
 
     let client = Client::builder()
@@ -171,17 +171,7 @@ async fn origin_form_with_url_map() {
         .build()
         .unwrap();
 
-    let cache = Cache::new(config.cache_dir.clone(), config.max_cache_size).unwrap();
-    let temp_dir = config.cache_dir.join("tmp");
-    tokio::fs::create_dir_all(&temp_dir).await.unwrap();
-
-    let state = AppState {
-        client: client.clone(),
-        config: Arc::new(config),
-        cache,
-        coalescer: Arc::new(Coalescer::new()),
-        temp_dir,
-    };
+    let state = AppState::from_config(config, client.clone());
 
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -208,19 +198,4 @@ async fn origin_form_with_url_map() {
         String::from_utf8_lossy(&body[..body.len().min(200)])
     );
     assert_eq!(body.len() as u64, size);
-}
-
-fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
-    let range = range.strip_prefix("bytes=")?;
-    let (start, end) = range.split_once('-')?;
-    let start: u64 = start.parse().ok()?;
-    let end: u64 = if end.is_empty() {
-        total - 1
-    } else {
-        end.parse().ok()?
-    };
-    if start > end || end >= total {
-        return None;
-    }
-    Some((start, end))
 }

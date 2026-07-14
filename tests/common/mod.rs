@@ -3,8 +3,6 @@
 use std::sync::Arc;
 
 use apt_blitz::build_app;
-use apt_blitz::cache::Cache;
-use apt_blitz::coalescer::Coalescer;
 use apt_blitz::config::Config;
 use apt_blitz::proxy::AppState;
 use reqwest::Client;
@@ -182,7 +180,7 @@ impl MockUpstream {
     }
 }
 
-fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
+pub fn parse_range(range: &str, total: u64) -> Option<(u64, u64)> {
     let range = range.strip_prefix("bytes=")?;
     let (start, end) = range.split_once('-')?;
     let start: u64 = start.parse().ok()?;
@@ -225,6 +223,11 @@ impl TestContext {
             url_maps: vec![],
             upstream_proxy: None,
             no_proxy: vec![],
+            max_connections_per_ip: 0,
+            max_total_connections: 0,
+            max_workers: 0,
+            upstream_bandwidth: 0,
+            per_ip_bandwidth: 0,
         };
 
         let client = Client::builder()
@@ -232,17 +235,48 @@ impl TestContext {
             .build()
             .unwrap();
 
-        let cache = Cache::new(config.cache_dir.clone(), config.max_cache_size).unwrap();
-        let temp_dir = config.cache_dir.join("tmp");
-        tokio::fs::create_dir_all(&temp_dir).await.unwrap();
+        let state = AppState::from_config(config, client.clone());
 
-        let state = AppState {
-            client: client.clone(),
-            config: Arc::new(config),
-            cache,
-            coalescer: Arc::new(Coalescer::new()),
-            temp_dir,
-        };
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let proxy_url = format!("http://{addr}");
+
+        let (tx, rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let shutdown_signal = async {
+                rx.await.ok();
+            };
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal)
+                .await
+                .ok();
+        });
+
+        Self {
+            upstream,
+            proxy_url,
+            client,
+            shutdown: Some(tx),
+            _cache_dir: cache_dir,
+        }
+    }
+
+    pub async fn with_config(max_cache_size: u64, config: Config) -> Self {
+        let upstream = MockUpstream::new().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let mut config = config;
+        config.cache_dir = cache_dir.path().join("cache");
+        config.max_cache_size = max_cache_size;
+
+        let client = Client::builder()
+            .user_agent("apt-blitz-test/0.1.0")
+            .build()
+            .unwrap();
+
+        let state = AppState::from_config(config, client.clone());
 
         let app = build_app(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

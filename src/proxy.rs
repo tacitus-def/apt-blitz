@@ -1,15 +1,20 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::FutureExt;
 use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::buffer::SegmentsBuffer;
@@ -17,7 +22,14 @@ use crate::cache::Cache;
 use crate::coalescer::{Coalescer, RegisterResult};
 use crate::config::{Config, ProxyType, UrlMap};
 use crate::downloader::download_multithreaded;
+
+enum CoalesceOutcome {
+    Cached { path: std::path::PathBuf, headers: HeaderMap },
+    FollowerBuffer(Arc<SegmentsBuffer>),
+    Leader,
+}
 use crate::ftp;
+use crate::rate_limit::{IpPermit, IpRateLimiter, TokenBucket, WorkerLimiter};
 
 fn can_multithread(content_length: Option<u64>, accept_ranges: Option<&http::HeaderValue>) -> bool {
     content_length.is_some() && accept_ranges == Some(&http::HeaderValue::from_static("bytes"))
@@ -33,6 +45,96 @@ const FORWARD_HEADERS: &[&str] = &[
     "cache-control",
     "expires",
 ];
+
+fn copy_forward_headers(from: &HeaderMap, to: &mut HeaderMap) {
+    for name in FORWARD_HEADERS {
+        if let Some(val) = from.get(*name) {
+            to.insert(*name, val.clone());
+        }
+    }
+}
+
+fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
+    download_handle: tokio::task::JoinHandle<Result<(), E>>,
+    buffer: Arc<SegmentsBuffer>,
+    url: String,
+    headers: HeaderMap,
+    cache: Arc<Cache>,
+    coalescer: Arc<Coalescer>,
+) {
+    tokio::spawn(async move {
+        match download_handle.await {
+            Ok(Ok(())) => {
+                info!(url = %url, "download complete, storing to cache");
+                let sync_buf = buffer.clone();
+                if tokio::task::spawn_blocking(move || sync_buf.sync())
+                    .await
+                    .is_ok_and(|r| r.is_ok())
+                {
+                    if let Err(e) = cache.store(&url, buffer.file_path(), &headers).await {
+                        error!(error = %e, "failed to store in cache");
+                        let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                    }
+                } else {
+                    error!("sync failed before cache store");
+                    let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                }
+            }
+            Ok(Err(e)) => {
+                error!(url = %url, error = ?e, "download failed, cleaning up");
+                buffer.set_failed();
+                let _ = tokio::fs::remove_file(buffer.file_path()).await;
+            }
+            Err(e) => {
+                error!(url = %url, error = ?e, "download task panicked, cleaning up temp");
+                buffer.set_failed();
+                let _ = tokio::fs::remove_file(buffer.file_path()).await;
+            }
+        }
+        coalescer.complete(&url);
+    });
+}
+
+async fn resolve_with_coalescing(
+    url: &str,
+    cache: &Cache,
+    coalescer: &Coalescer,
+) -> Result<CoalesceOutcome, ProxyError> {
+    let mut retries = 0u32;
+    loop {
+        if retries >= 5 {
+            return Err(ProxyError::Internal("too many retries waiting for in-flight download".into()));
+        }
+        retries += 1;
+
+        if let Some((cached_path, cached_headers)) = cache.lookup(url).await {
+            info!(url = %url, path = %cached_path.display(), "cache hit");
+            return Ok(CoalesceOutcome::Cached { path: cached_path, headers: cached_headers });
+        }
+
+        match coalescer.register(url) {
+            RegisterResult::Follower(rx) => {
+                info!(url = %url, "joining in-flight download as follower");
+                let buffer = match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                    Ok(Ok(buf)) => buf,
+                    _ => {
+                        info!(url = %url, "follower wait failed, retrying");
+                        continue;
+                    }
+                };
+                return Ok(CoalesceOutcome::FollowerBuffer(buffer));
+            }
+            RegisterResult::FollowerBuffer(buffer) => {
+                info!(url = %url, "joining completed in-flight download");
+                return Ok(CoalesceOutcome::FollowerBuffer(buffer));
+            }
+            RegisterResult::Leader => {
+                info!(url = %url, "becoming download leader");
+                return Ok(CoalesceOutcome::Leader);
+            }
+        }
+    }
+}
 
 /// Translate a fake‑host URL (`http://fake-host/…` or `ftp://fake-host/…`) to its real upstream URL.
 fn resolve_url(url: &str, maps: &[UrlMap]) -> String {
@@ -59,6 +161,43 @@ pub struct AppState {
     pub cache: Arc<Cache>,
     pub coalescer: Arc<Coalescer>,
     pub temp_dir: PathBuf,
+    pub ip_limiter: Arc<IpRateLimiter>,
+    pub worker_limiter: Arc<WorkerLimiter>,
+    pub upstream_bucket: Arc<TokenBucket>,
+    pub cancel: CancellationToken,
+}
+
+impl AppState {
+    pub fn from_config(config: Config, client: Client) -> Self {
+        let cache = Cache::new(config.cache_dir.clone(), config.max_cache_size)
+            .expect("failed to init cache");
+        let temp_dir = config.cache_dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+
+        Self {
+            client,
+            config: Arc::new(config.clone()),
+            cache,
+            coalescer: Arc::new(Coalescer::new()),
+            temp_dir,
+            ip_limiter: {
+                let limiter = Arc::new(IpRateLimiter::new(
+                    config.max_connections_per_ip,
+                    config.max_total_connections,
+                    config.per_ip_bandwidth,
+                ));
+                limiter.start_sweep();
+                limiter
+            },
+            worker_limiter: Arc::new(WorkerLimiter::new(config.max_workers)),
+            upstream_bucket: Arc::new(if config.upstream_bandwidth == 0 {
+                TokenBucket::unlimited()
+            } else {
+                TokenBucket::new(config.upstream_bandwidth, config.upstream_bandwidth)
+            }),
+            cancel: CancellationToken::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -66,6 +205,7 @@ pub enum ProxyError {
     BadRequest(String),
     Upstream(reqwest::Error),
     Internal(String),
+    TooManyRequests,
 }
 
 impl IntoResponse for ProxyError {
@@ -74,6 +214,10 @@ impl IntoResponse for ProxyError {
             ProxyError::BadRequest(s) => (StatusCode::BAD_REQUEST, s),
             ProxyError::Upstream(e) => (StatusCode::BAD_GATEWAY, e.to_string()),
             ProxyError::Internal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+            ProxyError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate limit exceeded".into(),
+            ),
         };
         Response::builder()
             .status(status)
@@ -88,11 +232,200 @@ impl From<reqwest::Error> for ProxyError {
     }
 }
 
+struct ThrottledPermitStream<S> {
+    inner: S,
+    _permit: IpPermit,
+    bucket: Option<TokenBucket>,
+    cancel: CancellationToken,
+    state: ThrottleState,
+    timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    pending: VecDeque<bytes::Bytes>,
+}
+
+enum ThrottleState {
+    Idle,
+    Waiting,
+}
+
+impl<S> ThrottledPermitStream<S> {
+    fn enqueue_chunk(&mut self, chunk: bytes::Bytes) {
+        if let Some(ref bucket) = self.bucket {
+            let max = bucket.max_tokens();
+            if chunk.len() as u64 <= max {
+                self.pending.push_back(chunk);
+            } else {
+                let mut offset = 0usize;
+                while offset < chunk.len() {
+                    let end = (offset + max as usize).min(chunk.len());
+                    self.pending.push_back(chunk.slice(offset..end));
+                    offset = end;
+                }
+            }
+        } else {
+            self.pending.push_back(chunk);
+        }
+    }
+
+    fn try_deliver(&mut self) -> Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
+        if let Some(ref bucket) = self.bucket {
+            while let Some(front) = self.pending.front() {
+                let len = front.len() as u64;
+                if bucket.try_consume(len) {
+                    let chunk = self.pending.pop_front().unwrap();
+                    return Poll::Ready(Some(Ok(chunk)));
+                }
+                return Poll::Pending;
+            }
+        } else if let Some(chunk) = self.pending.pop_front() {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
+        Poll::Pending
+    }
+}
+
+impl<S> futures_util::Stream for ThrottledPermitStream<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.cancel.is_cancelled() {
+            return Poll::Ready(None);
+        }
+
+        match self.state {
+            ThrottleState::Idle => {
+                // Deliver from pending buffer first.
+                if self.bucket.is_some() && !self.pending.is_empty() {
+                    match self.try_deliver() {
+                        Poll::Ready(item) => return Poll::Ready(item),
+                        Poll::Pending => {
+                            self.state = ThrottleState::Waiting;
+                            self.schedule_wake(cx);
+                            return Poll::Pending;
+                        }
+                    }
+                }
+
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Pending => {
+                        // Inner exhausted but pending has data — go to Waiting.
+                        if self.bucket.is_some() && !self.pending.is_empty() {
+                            self.state = ThrottleState::Waiting;
+                            self.schedule_wake(cx);
+                        }
+                        Poll::Pending
+                    }
+                    Poll::Ready(None) => {
+                        if self.pending.is_empty() {
+                            Poll::Ready(None)
+                        } else if self.bucket.is_none() {
+                            let chunk = self.pending.pop_front().unwrap();
+                            Poll::Ready(Some(Ok(chunk)))
+                        } else {
+                            self.state = ThrottleState::Waiting;
+                            self.schedule_wake(cx);
+                            Poll::Pending
+                        }
+                    }
+                    Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                    Poll::Ready(Some(Ok(chunk))) => {
+                        self.enqueue_chunk(chunk);
+                        if self.bucket.is_none() {
+                            let chunk = self.pending.pop_front().unwrap();
+                            return Poll::Ready(Some(Ok(chunk)));
+                        }
+                        match self.try_deliver() {
+                            Poll::Ready(item) => Poll::Ready(item),
+                            Poll::Pending => {
+                                self.state = ThrottleState::Waiting;
+                                self.schedule_wake(cx);
+                                Poll::Pending
+                            }
+                        }
+                    }
+                }
+            }
+            ThrottleState::Waiting => {
+                if let Some(ref mut timer) = self.timer {
+                    if timer.poll_unpin(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                }
+                self.timer = None;
+
+                match self.try_deliver() {
+                    Poll::Ready(item) => {
+                        self.state = ThrottleState::Idle;
+                        Poll::Ready(item)
+                    }
+                    Poll::Pending => {
+                        if self.pending.is_empty() {
+                            self.state = ThrottleState::Idle;
+                            return Poll::Pending;
+                        }
+                        self.schedule_wake(cx);
+                        Poll::Pending
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<S> ThrottledPermitStream<S> {
+    fn schedule_wake(&mut self, cx: &mut Context<'_>) {
+        if let Some(ref bucket) = self.bucket {
+            let remaining: u64 = self.pending.iter().map(|c| c.len() as u64).sum();
+            if remaining == 0 {
+                return;
+            }
+            let wait_nanos = bucket.wait_time_nanos(remaining);
+            let ms = if wait_nanos == 0 {
+                1
+            } else {
+                (wait_nanos / 1_000_000).max(1)
+            };
+            self.timer = Some(Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+            let _ = self.timer.as_mut().unwrap().poll_unpin(cx);
+        }
+    }
+}
+
+fn wrap_response_with_permit(resp: Response, permit: IpPermit, cancel: CancellationToken) -> Response {
+    let (parts, body) = resp.into_parts();
+    let per_ip_bucket = permit.per_ip_bucket.clone();
+    let stream = body.into_data_stream();
+    let mapped = stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let wrapped = ThrottledPermitStream {
+        inner: mapped,
+        _permit: permit,
+        bucket: per_ip_bucket,
+        cancel,
+        state: ThrottleState::Idle,
+        timer: None,
+        pending: VecDeque::new(),
+    };
+    Response::from_parts(parts, Body::from_stream(wrapped))
+}
+
 pub async fn handle_proxy(
     method: Method,
     State(state): State<AppState>,
     req: Request,
 ) -> Result<Response, ProxyError> {
+    let peer_ip = req
+        .extensions()
+        .get::<std::net::SocketAddr>()
+        .map(|a| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    let mut ip_permit = Some(state.ip_limiter.acquire(peer_ip).await.ok_or_else(|| {
+        ProxyError::TooManyRequests
+    })?);
+    let _per_ip_bucket = ip_permit.as_ref().and_then(|p| p.per_ip_bucket.clone());
+
     let uri_str = req.uri().to_string();
     let original_url = uri_str.strip_prefix('/').unwrap_or(&uri_str).to_string();
     let url = if original_url.contains("://") {
@@ -123,52 +456,30 @@ pub async fn handle_proxy(
     if method == Method::HEAD {
         info!(url = %url, "HEAD request, forwarding without body");
         let resp = state.client.head(&url).send().await?;
+        let mut fwd = HeaderMap::new();
+        copy_forward_headers(resp.headers(), &mut fwd);
         let mut builder = Response::builder().status(resp.status());
-        for name in FORWARD_HEADERS {
-            if let Some(val) = resp.headers().get(*name) {
-                builder = builder.header(*name, val);
-            }
+        for (name, val) in &fwd {
+            builder = builder.header(name, val);
         }
         return Ok(builder.body(Body::empty()).unwrap());
     }
 
     if url.starts_with("ftp://") || url.starts_with("ftps://") {
-        return handle_ftp_proxy(&url, &state).await;
+        let resp = handle_ftp_proxy(&url, &state).await?;
+        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
-    let mut retries = 0u32;
-    loop {
-        if retries >= 5 {
-            return Err(ProxyError::Internal("too many retries waiting for in-flight download".into()));
+    match resolve_with_coalescing(&url, &state.cache, &state.coalescer).await? {
+        CoalesceOutcome::Cached { path, headers } => {
+            let resp = serve_file(&path, &headers).await?;
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
-        retries += 1;
-
-        if let Some((cached_path, cached_headers)) = state.cache.lookup(&url).await {
-            info!(url = %url, path = %cached_path.display(), "cache hit");
-            return serve_file(&cached_path, &cached_headers).await;
+        CoalesceOutcome::FollowerBuffer(buffer) => {
+            let resp = serve_from_buffer(buffer).await;
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
-
-        match state.coalescer.register(&url) {
-            RegisterResult::Follower(rx) => {
-                info!(url = %url, "joining in-flight download as follower");
-                let buffer = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-                    Ok(Ok(buf)) => buf,
-                    _ => {
-                        info!(url = %url, "follower wait failed, retrying");
-                        continue;
-                    }
-                };
-                return Ok(serve_from_buffer(buffer, &url).await);
-            }
-            RegisterResult::FollowerBuffer(buffer) => {
-                info!(url = %url, "joining completed in-flight download");
-                return Ok(serve_from_buffer(buffer, &url).await);
-            }
-            RegisterResult::Leader => {
-                info!(url = %url, "becoming download leader");
-                break;
-            }
-        }
+        CoalesceOutcome::Leader => {}
     }
 
     let head_resp = state.client.head(&url).send().await?;
@@ -178,7 +489,8 @@ pub async fn handle_proxy(
             || head_status == StatusCode::NOT_IMPLEMENTED
         {
             state.coalescer.complete(&url);
-            return plain_proxy(&state.client, &url).await;
+            let resp = plain_proxy(&state.client, &url, &state.upstream_bucket).await?;
+            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         state.coalescer.complete(&url);
         head_resp.error_for_status().map_err(ProxyError::Upstream)?;
@@ -199,7 +511,8 @@ pub async fn handle_proxy(
             "falling back to plain proxy"
         );
         state.coalescer.complete(&url);
-        return plain_proxy(&state.client, &url).await;
+        let resp = plain_proxy(&state.client, &url, &state.upstream_bucket).await?;
+        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
     let total_size = content_length.unwrap();
@@ -223,11 +536,7 @@ pub async fn handle_proxy(
     let (buffer, notify_rx) = SegmentsBuffer::new(total_size, temp_file, temp_path);
 
     let mut resp_headers = HeaderMap::new();
-    for key in FORWARD_HEADERS {
-        if let Some(val) = headers.get(*key) {
-            resp_headers.insert(*key, val.clone());
-        }
-    }
+    copy_forward_headers(&headers, &mut resp_headers);
 
     let resp_status = StatusCode::OK;
     buffer.set_meta(resp_status, resp_headers.clone());
@@ -239,92 +548,50 @@ pub async fn handle_proxy(
     let dl_url = url.clone();
     let dl_buffer = buffer.clone();
     let dl_connections = state.config.connections;
+    let dl_worker_limiter = state.worker_limiter.clone();
+    let dl_upstream_bucket = state.upstream_bucket.clone();
     let download_handle = tokio::spawn(async move {
-        download_multithreaded(&dl_client, &dl_url, dl_buffer, dl_connections).await
+        download_multithreaded(
+            &dl_client,
+            &dl_url,
+            dl_buffer,
+            dl_connections,
+            &dl_worker_limiter,
+            &dl_upstream_bucket,
+        )
+        .await
     });
 
-    let cache_headers = resp_headers.clone();
-    let cache_state = state.clone();
-    let cache_url = url.clone();
-    let cache_buffer = buffer.clone();
-    tokio::spawn(async move {
-        match download_handle.await {
-            Ok(Ok(())) => {
-                info!(url = %cache_url, "download complete, storing to cache");
-                let sync_buf = cache_buffer.clone();
-                if tokio::task::spawn_blocking(move || sync_buf.sync())
-                    .await
-                    .is_ok_and(|r| r.is_ok())
-                {
-                    if let Err(e) = cache_state.cache.store(&cache_url, cache_buffer.file_path(), &cache_headers).await {
-                        error!(error = %e, "failed to store in cache");
-                        let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                    }
-                } else {
-                    error!("sync failed before cache store");
-                    let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                }
-            }
-            Ok(Err(e)) => {
-                error!(url = %cache_url, error = ?e, "multithreaded download failed, cleaning up");
-                cache_buffer.set_failed();
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-            Err(e) => {
-                error!(url = %cache_url, error = ?e, "download task panicked, cleaning up temp");
-                cache_buffer.set_failed();
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-        }
-        cache_state.coalescer.complete(&cache_url);
-    });
+    spawn_cache_persistence(
+        download_handle,
+        buffer.clone(),
+        url.clone(),
+        resp_headers.clone(),
+        state.cache.clone(),
+        state.coalescer.clone(),
+    );
 
-    let stream = make_buffer_stream(buffer, notify_rx, &url);
+    let stream = make_buffer_stream(buffer, notify_rx);
     let mut resp_builder = Response::builder().status(resp_status);
     for (key, val) in &resp_headers {
         resp_builder = resp_builder.header(key, val);
     }
     let resp = resp_builder.body(Body::from_stream(stream)).unwrap();
 
-    Ok(resp)
+    Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()))
 }
 
 async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, ProxyError> {
     info!(url = %url, "ftp request");
 
-    let mut retries = 0u32;
-    loop {
-        if retries >= 5 {
-            return Err(ProxyError::Internal("too many retries waiting for in-flight FTP download".into()));
+    match resolve_with_coalescing(url, &state.cache, &state.coalescer).await? {
+        CoalesceOutcome::Cached { path, headers } => {
+            return serve_file(&path, &headers).await;
         }
-        retries += 1;
-
-        if let Some((cached_path, cached_headers)) = state.cache.lookup(url).await {
-            info!(url = %url, path = %cached_path.display(), "FTP cache hit");
-            return serve_file(&cached_path, &cached_headers).await;
+        CoalesceOutcome::FollowerBuffer(buffer) => {
+            return Ok(serve_from_buffer(buffer).await);
         }
-
-        match state.coalescer.register(url) {
-            RegisterResult::Follower(rx) => {
-                info!(url = %url, "joining in-flight FTP download as follower");
-                let buffer = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-                    Ok(Ok(buf)) => buf,
-                    _ => {
-                        info!(url = %url, "FTP follower wait failed, retrying");
-                        continue;
-                    }
-                };
-                return Ok(serve_from_buffer(buffer, url).await);
-            }
-            RegisterResult::FollowerBuffer(buffer) => {
-                info!(url = %url, "joining completed in-flight FTP download");
-                return Ok(serve_from_buffer(buffer, url).await);
-            }
-            RegisterResult::Leader => {
-                info!(url = %url, "becoming FTP download leader");
-                break;
-            }
-        }
+        CoalesceOutcome::Leader => {}
     }
 
     let ftp_url = match ftp::parse_ftp_url(url) {
@@ -363,45 +630,22 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
     let dl_url = ftp_url.clone();
     let dl_buffer = buffer.clone();
     let dl_connections = state.config.connections;
+    let dl_worker_limiter = state.worker_limiter.clone();
+    let dl_upstream_bucket = state.upstream_bucket.clone();
     let download_handle = tokio::spawn(async move {
-        ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections).await
+        ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections, &dl_worker_limiter, &dl_upstream_bucket).await
     });
 
-    let cache_headers = resp_headers.clone();
-    let cache_state = state.clone();
-    let cache_url = url.to_string();
-    let cache_buffer = buffer.clone();
-    tokio::spawn(async move {
-        match download_handle.await {
-            Ok(Ok(())) => {
-                info!(url = %cache_url, "FTP download complete, storing to cache");
-                let sync_buf = cache_buffer.clone();
-                if tokio::task::spawn_blocking(move || sync_buf.sync())
-                    .await
-                    .is_ok_and(|r| r.is_ok())
-                {
-                    if let Err(e) = cache_state.cache.store(&cache_url, cache_buffer.file_path(), &cache_headers).await {
-                        error!(error = %e, "FTP cache store failed");
-                        let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                    }
-                } else {
-                    error!("FTP sync failed before cache store");
-                    let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-                }
-            }
-            Ok(Err(e)) => {
-                error!(url = %cache_url, error = ?e, "FTP download failed");
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-            Err(e) => {
-                error!(url = %cache_url, error = ?e, "FTP download task panicked");
-                let _ = tokio::fs::remove_file(cache_buffer.file_path()).await;
-            }
-        }
-        cache_state.coalescer.complete(&cache_url);
-    });
+    spawn_cache_persistence(
+        download_handle,
+        buffer.clone(),
+        url.to_string(),
+        resp_headers.clone(),
+        state.cache.clone(),
+        state.coalescer.clone(),
+    );
 
-    let stream = make_buffer_stream(buffer, notify_rx, url);
+    let stream = make_buffer_stream(buffer, notify_rx);
     let mut resp_builder = Response::builder().status(resp_status);
     for (key, val) in &resp_headers {
         resp_builder = resp_builder.header(key, val);
@@ -410,10 +654,10 @@ async fn handle_ftp_proxy(url: &str, state: &AppState) -> Result<Response, Proxy
     Ok(resp)
 }
 
-async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, url: &str) -> Response {
+async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>) -> Response {
     let meta = buffer.wait_meta().await;
     let rx = buffer.subscribe();
-    let stream = make_buffer_stream(buffer, rx, url);
+    let stream = make_buffer_stream(buffer, rx);
     let mut resp_builder = Response::builder().status(meta.0);
     for (key, val) in &meta.1 {
         resp_builder = resp_builder.header(key, val);
@@ -424,13 +668,10 @@ async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, url: &str) -> Response {
 fn make_buffer_stream(
     buffer: Arc<SegmentsBuffer>,
     notify_rx: broadcast::Receiver<usize>,
-    url: &str,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
-    let url = url.to_string();
     struct StreamState {
         buffer: Arc<SegmentsBuffer>,
         notify_rx: broadcast::Receiver<usize>,
-        url: String,
         current_segment: usize,
         offset_in_segment: u64,
         errored: bool,
@@ -439,7 +680,6 @@ fn make_buffer_stream(
     let initial = StreamState {
         buffer,
         notify_rx,
-        url,
         current_segment: 0,
         offset_in_segment: 0,
         errored: false,
@@ -514,22 +754,45 @@ fn make_buffer_stream(
     })
 }
 
-async fn plain_proxy(client: &Client, url: &str) -> Result<Response, ProxyError> {
+async fn plain_proxy(
+    client: &Client,
+    url: &str,
+    upstream_bucket: &TokenBucket,
+) -> Result<Response, ProxyError> {
     info!(url = %url, "plain proxy mode");
 
     let resp = client.get(url).send().await?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 
-    let stream = resp.bytes_stream().map(|r| {
-        r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    let bucket = upstream_bucket.clone();
+    let stream = resp.bytes_stream().filter_map(move |r| {
+        let bucket = bucket.clone();
+        async move {
+            match r {
+                Ok(chunk) => {
+                    let len = chunk.len() as u64;
+                    if !bucket.try_consume(len) {
+                        return Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "upstream bandwidth limit exceeded",
+                        )));
+                    }
+                    Some(Ok(chunk))
+                }
+                Err(e) => Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e,
+                ))),
+            }
+        }
     });
 
+    let mut fwd = HeaderMap::new();
+    copy_forward_headers(&resp_headers, &mut fwd);
     let mut builder = Response::builder().status(status);
-    for name in FORWARD_HEADERS {
-        if let Some(val) = resp_headers.get(*name) {
-            builder = builder.header(*name, val);
-        }
+    for (name, val) in &fwd {
+        builder = builder.header(name, val);
     }
 
     Ok(builder.body(Body::from_stream(stream)).unwrap())
@@ -995,7 +1258,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/x");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1047,7 +1310,7 @@ mod tests {
         buffer.mark_ready(id2);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/y");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1085,7 +1348,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/z");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1121,12 +1384,203 @@ mod tests {
         buffer.set_failed();
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx, "http://test/fail");
+        let stream = make_buffer_stream(buffer.clone(), stream_rx);
         let result: Vec<_> = futures_util::StreamExt::collect::<Vec<_>>(stream).await;
 
         assert_eq!(result.len(), 1);
         assert!(result[0].is_err());
         std::fs::remove_file(buffer.file_path()).ok();
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_no_bucket_passthrough() {
+        let data = vec![
+            Ok(bytes::Bytes::from_static(b"hello")),
+            Ok(bytes::Bytes::from_static(b" world")),
+        ];
+        let inner = futures_util::stream::iter(data);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: None,
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            pending: VecDeque::new(),
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].as_ref().unwrap().as_ref(), b"hello");
+        assert_eq!(result[1].as_ref().unwrap().as_ref(), b" world");
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_with_enough_tokens() {
+        let data = vec![
+            Ok(bytes::Bytes::from_static(b"abcdef")),
+        ];
+        let inner = futures_util::stream::iter(data);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(1000, 1000);
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            pending: VecDeque::new(),
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref().unwrap().as_ref(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_throttles_and_delivers() {
+        let chunk = bytes::Bytes::from_static(b"throttled data");
+        let inner = futures_util::stream::iter(vec![Ok(chunk.clone())]);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(100, 100);
+        let _ = bucket.try_consume(100);
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            pending: VecDeque::new(),
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].as_ref().unwrap().as_ref(), b"throttled data");
+    }
+
+    #[tokio::test]
+    async fn test_plain_proxy_upstream_bandwidth_error() {
+        use wiremock::matchers::method;
+        let server = wiremock::MockServer::start().await;
+        let data = b"hello upstream";
+        wiremock::Mock::given(method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-length", data.len().to_string())
+                    .set_body_bytes(data),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let upstream_bucket = TokenBucket::new(0, 0);
+        let result = plain_proxy(&client, &format!("{}/test", server.uri()), &upstream_bucket).await;
+        assert!(result.is_ok());
+        let resp = result.unwrap();
+        use futures_util::TryStreamExt;
+        let body_result = resp.into_body().into_data_stream().try_collect::<Vec<_>>().await;
+        assert!(body_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_cancel_stops() {
+        let data = vec![Ok(bytes::Bytes::from_static(b"data"))];
+        let inner = futures_util::stream::iter(data);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(100, 100);
+        let _ = bucket.try_consume(100);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            pending: VecDeque::new(),
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_throttled_stream_oversized_chunk_splits() {
+        let data = vec![0xABu8; 250];
+        let chunk = bytes::Bytes::from(data.clone());
+        assert_eq!(chunk.len(), 250);
+        let inner = futures_util::stream::iter(vec![Ok(chunk)]);
+        let permit = IpPermit {
+            _global: {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+                sem.try_acquire_owned().unwrap()
+            },
+            _per_ip: None,
+            per_ip_bucket: None,
+        };
+        let bucket = TokenBucket::new(100, 1000); // max_tokens = 100, refill 1000/s
+        let cancel = CancellationToken::new();
+
+        let stream = ThrottledPermitStream {
+            inner,
+            _permit: permit,
+            bucket: Some(bucket),
+            cancel,
+            state: ThrottleState::Idle,
+            timer: None,
+            pending: VecDeque::new(),
+        };
+
+        let result: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].as_ref().unwrap().len(), 100);
+        assert_eq!(result[1].as_ref().unwrap().len(), 100);
+        assert_eq!(result[2].as_ref().unwrap().len(), 50);
+
+        let mut assembled = Vec::new();
+        for r in &result {
+            assembled.extend_from_slice(r.as_ref().unwrap());
+        }
+        assert_eq!(assembled.as_slice(), data.as_slice());
     }
 }
 

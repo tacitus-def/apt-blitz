@@ -10,6 +10,7 @@ pub mod config;
 pub mod downloader;
 pub mod ftp;
 pub mod proxy;
+pub mod rate_limit;
 
 use std::sync::Arc;
 
@@ -28,6 +29,8 @@ use crate::cache::Cache;
 use crate::coalescer::Coalescer;
 use crate::config::{Config, ProxyType};
 use crate::proxy::{handle_connect_tunnel, handle_proxy, AppState};
+use crate::rate_limit::{IpRateLimiter, TokenBucket, WorkerLimiter};
+use tokio_util::sync::CancellationToken;
 
 pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
     info!(%config, "starting apt-blitz");
@@ -83,6 +86,22 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
         cache,
         coalescer: Arc::new(Coalescer::new()),
         temp_dir,
+        ip_limiter: {
+            let limiter = Arc::new(IpRateLimiter::new(
+                config.max_connections_per_ip,
+                config.max_total_connections,
+                config.per_ip_bandwidth,
+            ));
+            limiter.start_sweep();
+            limiter
+        },
+        worker_limiter: Arc::new(WorkerLimiter::new(config.max_workers)),
+        upstream_bucket: Arc::new(if config.upstream_bandwidth == 0 {
+            TokenBucket::unlimited()
+        } else {
+            TokenBucket::new(config.upstream_bandwidth, config.upstream_bandwidth)
+        }),
+        cancel: CancellationToken::new(),
     };
 
     let router = build_app(state);
@@ -101,7 +120,7 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
             }
 
             result = listener.accept() => {
-                let (stream, _peer) = match result {
+                let (stream, peer) = match result {
                     Ok(v) => v,
                     Err(e) => {
                         error!("accept error: {e}");
@@ -110,8 +129,9 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
                 };
                 let router = router.clone();
                 let cfg = config.clone();
+                let peer_addr = peer;
                 join_set.spawn(async move {
-                    handle_connection(stream, router, cfg).await;
+                    handle_connection(stream, router, cfg, peer_addr).await;
                 });
             }
         }
@@ -133,6 +153,7 @@ async fn handle_connection(
     stream: TcpStream,
     router: Router,
     config: Arc<Config>,
+    peer_addr: std::net::SocketAddr,
 ) {
     let mut peek_buf = [0u8; 7];
     match stream.peek(&mut peek_buf).await {
@@ -149,13 +170,15 @@ async fn handle_connection(
 
     let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
         let mut router = router.clone();
+        let peer = peer_addr;
         async move {
             let (parts, incoming) = req.into_parts();
             let stream = incoming
                 .into_data_stream()
                 .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
             let body = axum::body::Body::from_stream(stream);
-            let axum_req = axum::http::Request::from_parts(parts, body);
+            let mut axum_req = axum::http::Request::from_parts(parts, body);
+            axum_req.extensions_mut().insert(peer);
             router.call(axum_req).await
         }
     });
@@ -168,5 +191,26 @@ async fn handle_connection(
         .await
     {
         debug!("HTTP connection error: {err}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::sync::Arc;
+    use crate::buffer::SegmentsBuffer;
+
+    pub fn create_temp_buffer(size: u64) -> Arc<SegmentsBuffer> {
+        let dir = std::env::temp_dir().join("apt-blitz-test-buffer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.download", uuid::Uuid::new_v4()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(size).unwrap();
+        let (buffer, _) = SegmentsBuffer::new(size, file, path);
+        buffer
     }
 }
