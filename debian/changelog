@@ -1,3 +1,12 @@
+apt-blitz (0.5.0-1) unstable; urgency=medium
+
+  * Adaptive worker pool: start with min(connections, 4) workers,
+    scale up on successful segments, degrade gracefully on failures.
+  * Download no longer aborts on first worker error; fails only
+    when all workers are dead and buffer is incomplete.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 15 Jul 2026 00:00:00 +0300
+
 apt-blitz (0.4.3-1) unstable; urgency=medium
 
   * Add per-stream read timeout (30s) with automatic retry on hang.

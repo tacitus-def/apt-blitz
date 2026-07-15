@@ -1,7 +1,10 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -12,6 +15,8 @@ pub(crate) const MIN_SEGMENT_SIZE: u64 = 64 * 1024;
 pub(crate) const MAX_SEGMENT_SIZE: u64 = 4 * 1024 * 1024;
 const INITIAL_SEGMENT_SIZE: u64 = 1024 * 1024;
 pub(crate) const TARGET_SEGMENT_TIME_SECS: f64 = 2.0;
+
+const INITIAL_WORKER_COUNT: usize = 4;
 
 const MAX_SEGMENT_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 200;
@@ -51,6 +56,37 @@ impl From<std::io::Error> for DownloadError {
     }
 }
 
+fn spawn_one_worker(
+    id: usize,
+    client: &reqwest::Client,
+    url: &str,
+    buffer: &Arc<SegmentsBuffer>,
+    cancel: &CancellationToken,
+    upstream_bucket: &TokenBucket,
+    worker_limiter: &WorkerLimiter,
+    ready_tx: &mpsc::UnboundedSender<()>,
+    active: &Arc<AtomicUsize>,
+    join_set: &mut JoinSet<Result<(), DownloadError>>,
+    req_id: u64,
+) {
+    let client = client.clone();
+    let url = url.to_string();
+    let buffer = buffer.clone();
+    let child_token = cancel.child_token();
+    let bucket = upstream_bucket.clone();
+    let limiter = worker_limiter.clone();
+    let tx = ready_tx.clone();
+    let active = active.clone();
+    active.fetch_add(1, Ordering::SeqCst);
+    join_set.spawn(async move {
+        let _permit = limiter.acquire().await;
+        let result =
+            download_worker(&client, &url, buffer, child_token, id, &bucket, &tx, req_id).await;
+        active.fetch_sub(1, Ordering::SeqCst);
+        result
+    });
+}
+
 pub async fn download_multithreaded(
     client: &reqwest::Client,
     url: &str,
@@ -61,44 +97,92 @@ pub async fn download_multithreaded(
     req_id: u64,
 ) -> Result<(), DownloadError> {
     let cancel = CancellationToken::new();
-    let mut handles = Vec::with_capacity(num_connections);
-    let worker_limiter = worker_limiter.clone();
-    let upstream_bucket = upstream_bucket.clone();
 
-    for i in 0..num_connections {
-        let client = client.clone();
-        let url = url.to_string();
-        let buffer = buffer.clone();
-        let child_token = cancel.child_token();
-        let bucket = upstream_bucket.clone();
-        let limiter = worker_limiter.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = limiter.acquire().await;
-            download_worker(&client, &url, buffer, child_token, i, &bucket, req_id).await
-        }));
+    let active = Arc::new(AtomicUsize::new(0));
+    let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<()>();
+    let mut join_set: JoinSet<Result<(), DownloadError>> = JoinSet::new();
+
+    let initial = num_connections.min(INITIAL_WORKER_COUNT);
+    let mut total_spawned: usize = 0;
+
+    for i in 0..initial {
+        spawn_one_worker(
+            i,
+            client,
+            url,
+            &buffer,
+            &cancel,
+            upstream_bucket,
+            worker_limiter,
+            &ready_tx,
+            &active,
+            &mut join_set,
+            req_id,
+        );
+        total_spawned += 1;
     }
 
-    let mut errors = Vec::new();
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(DownloadError::Cancelled)) => {}
-            Ok(Err(e)) => {
-                error!(req_id, error = ?e, "downloader worker failed");
-                errors.push(e);
-                cancel.cancel();
+    loop {
+        tokio::select! {
+            ready = ready_rx.recv() => {
+                match ready {
+                    Some(()) => {
+                        if total_spawned < num_connections {
+                            spawn_one_worker(
+                                total_spawned,
+                                client,
+                                url,
+                                &buffer,
+                                &cancel,
+                                upstream_bucket,
+                                worker_limiter,
+                                &ready_tx,
+                                &active,
+                                &mut join_set,
+                                req_id,
+                            );
+                            total_spawned += 1;
+                        }
+                    }
+                    None => break,
+                }
             }
-            Err(e) => {
-                error!(req_id, error = ?e, "downloader worker panicked");
-                errors.push(DownloadError::BufferFailed);
-                cancel.cancel();
+            result = join_set.join_next() => {
+                match result {
+                    Some(Ok(Ok(()))) => {}
+                    Some(Ok(Err(DownloadError::Cancelled))) => {}
+                    Some(Ok(Err(e))) => {
+                        error!(req_id, error = ?e, "downloader worker failed");
+                    }
+                    Some(Err(e)) => {
+                        error!(req_id, error = ?e, "downloader worker panicked");
+                    }
+                    None => break,
+                }
+                if active.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
             }
         }
     }
 
-    if errors.is_empty() {
+    drop(ready_tx);
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(Ok(())) | Ok(Err(DownloadError::Cancelled)) => {}
+            Ok(Err(e)) => {
+                error!(req_id, error = ?e, "downloader worker failed");
+            }
+            Err(e) => {
+                error!(req_id, error = ?e, "downloader worker panicked");
+            }
+        }
+    }
+
+    if buffer.all_completed() {
         Ok(())
     } else {
+        cancel.cancel();
         Err(DownloadError::BufferFailed)
     }
 }
@@ -110,6 +194,7 @@ async fn download_worker(
     cancel: CancellationToken,
     worker_id: usize,
     upstream_bucket: &TokenBucket,
+    segment_ready_tx: &mpsc::UnboundedSender<()>,
     req_id: u64,
 ) -> Result<(), DownloadError> {
     let mut preferred_size = INITIAL_SEGMENT_SIZE;
@@ -352,6 +437,7 @@ async fn download_worker(
         }
 
         buffer.mark_ready(id);
+        let _ = segment_ready_tx.send(());
         info!(
             req_id,
             worker = worker_id,
@@ -507,6 +593,11 @@ mod tests {
         crate::test_util::create_temp_buffer(size)
     }
 
+    fn dummy_ready_tx() -> mpsc::UnboundedSender<()> {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        tx
+    }
+
     #[tokio::test]
     async fn test_download_worker_small_file() {
         use wiremock::matchers::{method, path};
@@ -532,7 +623,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
         assert!(result.is_ok());
 
         assert!(buffer.all_completed());
@@ -569,7 +660,7 @@ mod tests {
 
         cancel.cancel();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
     }
 
@@ -656,7 +747,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
         assert!(result.is_err());
     }
 
@@ -684,7 +775,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
         assert!(result.is_err());
 
         let read = buffer.read_data(0, 1024).unwrap();
@@ -717,7 +808,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
         assert!(result.is_ok());
 
         let read = buffer.read_data(0, 2048).unwrap();
@@ -748,10 +839,44 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
         assert!(result.is_ok());
 
         let read = buffer.read_data(0, 512).unwrap();
         assert_eq!(&read[..], &data[..]);
+    }
+
+    #[tokio::test]
+    async fn test_download_worker_sends_segment_ready_signal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let data = vec![0xAAu8; 2048];
+
+        Mock::given(method("GET"))
+            .and(path("/signal.dat"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-2047/2048")
+                    .set_body_bytes(data.as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/signal.dat", server.uri());
+        let buffer = create_temp_buffer(2048);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &tx, 0).await;
+        assert!(result.is_ok());
+        assert!(buffer.all_completed());
+
+        let signal = rx.try_recv();
+        assert!(signal.is_ok(), "worker should have sent a segment ready signal");
+        assert!(rx.try_recv().is_err(), "only one signal expected for single segment");
     }
 }
