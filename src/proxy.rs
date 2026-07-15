@@ -481,6 +481,8 @@ pub async fn handle_proxy(
         .map(|a| a.ip())
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
+    let user_agent = req.headers().get("user-agent").cloned();
+
     let uri_str = req.uri().to_string();
     let original_url = uri_str.strip_prefix('/').unwrap_or(&uri_str).to_string();
     let url = if original_url.contains("://") {
@@ -501,7 +503,7 @@ pub async fn handle_proxy(
     let req_id = NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed);
     let span = info_span!("request", req_id, url = %url);
 
-    handle_proxy_inner(method, state, peer_ip, url, req_id)
+    handle_proxy_inner(method, state, peer_ip, url, user_agent, req_id)
         .instrument(span)
         .await
 }
@@ -511,6 +513,7 @@ async fn handle_proxy_inner(
     state: AppState,
     peer_ip: std::net::IpAddr,
     url: String,
+    user_agent: Option<http::HeaderValue>,
     req_id: u64,
 ) -> Result<Response, ProxyError> {
     let mut ip_permit = Some(state.ip_limiter.acquire(peer_ip).await.ok_or_else(|| {
@@ -529,7 +532,11 @@ async fn handle_proxy_inner(
 
     if method == Method::HEAD {
         info!(req_id, "HEAD request, forwarding without body");
-        let resp = state.client.head(&url).send().await?;
+        let mut builder = state.client.head(&url);
+        if let Some(ua) = &user_agent {
+            builder = builder.header("user-agent", ua);
+        }
+        let resp = builder.send().await?;
         let mut fwd = HeaderMap::new();
         copy_forward_headers(resp.headers(), &mut fwd);
         let mut builder = Response::builder().status(resp.status());
@@ -556,14 +563,20 @@ async fn handle_proxy_inner(
         CoalesceOutcome::Leader => {}
     }
 
-    let head_resp = state.client.head(&url).send().await?;
+    let head_resp = {
+        let mut builder = state.client.head(&url);
+        if let Some(ua) = &user_agent {
+            builder = builder.header("user-agent", ua);
+        }
+        builder.send().await?
+    };
     let head_status = head_resp.status();
     if !head_status.is_success() {
         if head_status == StatusCode::METHOD_NOT_ALLOWED
             || head_status == StatusCode::NOT_IMPLEMENTED
         {
             state.coalescer.complete(&url);
-            let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, req_id).await?;
+            let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         state.coalescer.complete(&url);
@@ -586,7 +599,7 @@ async fn handle_proxy_inner(
             "falling back to plain proxy"
         );
         state.coalescer.complete(&url);
-        let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, req_id).await?;
+        let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
         return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
@@ -626,6 +639,7 @@ async fn handle_proxy_inner(
     let dl_connections = state.config.connections;
     let dl_worker_limiter = state.worker_limiter.clone();
     let dl_upstream_bucket = state.upstream_bucket.clone();
+    let dl_user_agent = user_agent;
     let dl_req_id = req_id;
     let download_handle = tokio::spawn(async move {
         download_multithreaded(
@@ -635,6 +649,7 @@ async fn handle_proxy_inner(
             dl_connections,
             &dl_worker_limiter,
             &dl_upstream_bucket,
+            dl_user_agent,
             dl_req_id,
         )
         .await
@@ -841,11 +856,16 @@ async fn plain_proxy(
     client: &Client,
     url: &str,
     upstream_bucket: &TokenBucket,
+    user_agent: Option<&http::HeaderValue>,
     req_id: u64,
 ) -> Result<Response, ProxyError> {
     info!(req_id, "plain proxy mode");
 
-    let resp = client.get(url).send().await?;
+    let mut builder = client.get(url);
+    if let Some(ua) = user_agent {
+        builder = builder.header("user-agent", ua);
+    }
+    let resp = builder.send().await?;
     let status = resp.status();
     let resp_headers = resp.headers().clone();
 
@@ -1588,7 +1608,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let upstream_bucket = TokenBucket::new(0, 0);
-        let result = plain_proxy(&client, &format!("{}/test", server.uri()), &upstream_bucket, 0).await;
+        let result = plain_proxy(&client, &format!("{}/test", server.uri()), &upstream_bucket, None, 0).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         use futures_util::TryStreamExt;

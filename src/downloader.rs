@@ -16,7 +16,7 @@ pub(crate) const MAX_SEGMENT_SIZE: u64 = 4 * 1024 * 1024;
 const INITIAL_SEGMENT_SIZE: u64 = 1024 * 1024;
 pub(crate) const TARGET_SEGMENT_TIME_SECS: f64 = 2.0;
 
-const INITIAL_WORKER_COUNT: usize = 4;
+const INITIAL_WORKER_COUNT: usize = 1;
 
 const MAX_SEGMENT_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 200;
@@ -67,6 +67,7 @@ fn spawn_one_worker(
     ready_tx: &mpsc::UnboundedSender<()>,
     active: &Arc<AtomicUsize>,
     join_set: &mut JoinSet<Result<(), DownloadError>>,
+    user_agent: Option<&http::HeaderValue>,
     req_id: u64,
 ) {
     let client = client.clone();
@@ -77,11 +78,22 @@ fn spawn_one_worker(
     let limiter = worker_limiter.clone();
     let tx = ready_tx.clone();
     let active = active.clone();
+    let ua = user_agent.cloned();
     active.fetch_add(1, Ordering::SeqCst);
     join_set.spawn(async move {
         let _permit = limiter.acquire().await;
-        let result =
-            download_worker(&client, &url, buffer, child_token, id, &bucket, &tx, req_id).await;
+        let result = download_worker(
+            &client,
+            &url,
+            buffer,
+            child_token,
+            id,
+            &bucket,
+            &tx,
+            ua.as_ref(),
+            req_id,
+        )
+        .await;
         active.fetch_sub(1, Ordering::SeqCst);
         result
     });
@@ -94,6 +106,7 @@ pub async fn download_multithreaded(
     num_connections: usize,
     worker_limiter: &WorkerLimiter,
     upstream_bucket: &TokenBucket,
+    user_agent: Option<http::HeaderValue>,
     req_id: u64,
 ) -> Result<(), DownloadError> {
     let cancel = CancellationToken::new();
@@ -117,6 +130,7 @@ pub async fn download_multithreaded(
             &ready_tx,
             &active,
             &mut join_set,
+            user_agent.as_ref(),
             req_id,
         );
         total_spawned += 1;
@@ -139,6 +153,7 @@ pub async fn download_multithreaded(
                                 &ready_tx,
                                 &active,
                                 &mut join_set,
+                                user_agent.as_ref(),
                                 req_id,
                             );
                             total_spawned += 1;
@@ -195,6 +210,7 @@ async fn download_worker(
     worker_id: usize,
     upstream_bucket: &TokenBucket,
     segment_ready_tx: &mpsc::UnboundedSender<()>,
+    user_agent: Option<&http::HeaderValue>,
     req_id: u64,
 ) -> Result<(), DownloadError> {
     let mut preferred_size = INITIAL_SEGMENT_SIZE;
@@ -230,30 +246,31 @@ async fn download_worker(
                 return Err(DownloadError::Cancelled);
             }
 
-            let response = match client
-                .get(url)
-                .header("Range", &range_header)
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    if is_transient_error(&e) && attempt < MAX_SEGMENT_RETRIES {
-                        let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
-                        warn!(
-                            req_id,
-                            worker = worker_id,
-                            segment = id,
-                            attempt,
-                            delay_ms = delay,
-                            error = %e,
-                            "transient send error, retrying"
-                        );
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                        last_err = Some(DownloadError::Reqwest(e));
-                        continue;
+            let response = {
+                let mut builder = client.get(url).header("Range", &range_header);
+                if let Some(ua) = user_agent {
+                    builder = builder.header("user-agent", ua);
+                }
+                match builder.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if is_transient_error(&e) && attempt < MAX_SEGMENT_RETRIES {
+                            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
+                            warn!(
+                                req_id,
+                                worker = worker_id,
+                                segment = id,
+                                attempt,
+                                delay_ms = delay,
+                                error = %e,
+                                "transient send error, retrying"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            last_err = Some(DownloadError::Reqwest(e));
+                            continue;
+                        }
+                        return Err(DownloadError::Reqwest(e));
                     }
-                    return Err(DownloadError::Reqwest(e));
                 }
             };
 
@@ -623,7 +640,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(result.is_ok());
 
         assert!(buffer.all_completed());
@@ -660,7 +677,7 @@ mod tests {
 
         cancel.cancel();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
     }
 
@@ -747,7 +764,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(result.is_err());
     }
 
@@ -775,7 +792,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(result.is_err());
 
         let read = buffer.read_data(0, 1024).unwrap();
@@ -808,7 +825,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(result.is_ok());
 
         let read = buffer.read_data(0, 2048).unwrap();
@@ -839,7 +856,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(result.is_ok());
 
         let read = buffer.read_data(0, 512).unwrap();
@@ -871,7 +888,7 @@ mod tests {
         let bucket = TokenBucket::unlimited();
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &tx, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &tx, None, 0).await;
         assert!(result.is_ok());
         assert!(buffer.all_completed());
 
