@@ -1,3 +1,13 @@
+apt-blitz (0.4.3-1) unstable; urgency=medium
+
+  * Add per-stream read timeout (30s) with automatic retry on hang.
+  * Validate segment volume after download; retry on mismatch.
+  * Handle HTTP 200 instead of 206: truncate writes to segment boundary.
+  * Add connect_timeout(10s) and overall timeout(300s) to reqwest client.
+  * Warn on Content-Length vs range mismatch in 206 responses.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 15 Jul 2026 00:00:00 +0300
+
 apt-blitz (0.4.2-1) unstable; urgency=medium
 
   * Fix is_transient_error to cover Decode and Request error kinds,
