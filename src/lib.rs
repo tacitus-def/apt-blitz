@@ -13,6 +13,7 @@ pub mod proxy;
 pub mod rate_limit;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use futures_util::StreamExt;
@@ -38,7 +39,9 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
     let config = Arc::new(config);
 
     let mut client_builder = Client::builder()
-        .user_agent("apt-blitz/0.1.0");
+        .user_agent("apt-blitz/0.1.0")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(300));
 
     if let Some(ref proxy_cfg) = config.upstream_proxy {
         let proxy_url = match proxy_cfg.proxy_type {

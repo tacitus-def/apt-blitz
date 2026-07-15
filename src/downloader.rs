@@ -15,6 +15,7 @@ pub(crate) const TARGET_SEGMENT_TIME_SECS: f64 = 2.0;
 
 const MAX_SEGMENT_RETRIES: u32 = 3;
 const BASE_RETRY_DELAY_MS: u64 = 200;
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn is_transient_error(e: &reqwest::Error) -> bool {
     e.is_connect() || e.is_body() || e.is_timeout() || e.is_decode() || e.is_request()
@@ -183,24 +184,43 @@ async fn download_worker(
                 return Err(DownloadError::HttpStatus(status));
             }
 
+            if status == StatusCode::OK {
+                warn!(
+                    req_id,
+                    worker = worker_id,
+                    segment = id,
+                    "server ignores Range header (200 OK instead of 206); \
+                     segment will be truncated to expected size"
+                );
+            }
+
+            if let Some(content_length) = response.content_length() {
+                if status == StatusCode::PARTIAL_CONTENT && content_length != size {
+                    warn!(
+                        req_id,
+                        worker = worker_id,
+                        segment = id,
+                        content_length,
+                        expected = size,
+                        "Content-Length mismatch for partial content"
+                    );
+                }
+            }
+
             let mut stream = response.bytes_stream();
             let mut file_offset = start;
             let mut stream_failed = false;
 
-            while let Some(chunk) = stream.next().await {
-                if cancel.is_cancelled() {
-                    return Err(DownloadError::Cancelled);
-                }
-                match chunk {
-                    Ok(chunk) => {
-                        let len = chunk.len() as u64;
-                        if !upstream_bucket.wait_consume(len, &cancel).await {
-                            return Err(DownloadError::Cancelled);
-                        }
-                        buffer.write_data(file_offset, &chunk)?;
-                        file_offset += len;
-                    }
-                    Err(e) => {
+            loop {
+                let chunk_result = tokio::time::timeout(
+                    STREAM_READ_TIMEOUT,
+                    stream.next(),
+                )
+                .await;
+
+                match chunk_result {
+                    Ok(None) => break,
+                    Ok(Some(Err(e))) => {
                         if is_transient_error(&e) && attempt < MAX_SEGMENT_RETRIES {
                             let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
                             warn!(
@@ -220,11 +240,97 @@ async fn download_worker(
                         }
                         break;
                     }
+                    Ok(Some(Ok(chunk))) => {
+                        if cancel.is_cancelled() {
+                            return Err(DownloadError::Cancelled);
+                        }
+                        let mut remaining = chunk.len() as u64;
+                        let mut chunk_offset = 0;
+                        while remaining > 0 {
+                            let bytes_until_end = end.saturating_sub(file_offset);
+                            if bytes_until_end == 0 {
+                                break;
+                            }
+                            let to_write = remaining.min(bytes_until_end) as usize;
+                            let to_write = to_write.min(chunk.len() - chunk_offset);
+                            if !upstream_bucket
+                                .wait_consume(to_write as u64, &cancel)
+                                .await
+                            {
+                                return Err(DownloadError::Cancelled);
+                            }
+                            buffer
+                                .write_data(file_offset, &chunk[chunk_offset..chunk_offset + to_write])?;
+                            file_offset += to_write as u64;
+                            chunk_offset += to_write;
+                            remaining -= to_write as u64;
+                        }
+                        if file_offset >= end {
+                            break;
+                        }
+                    }
+                    Err(_elapsed) => {
+                        let io_err = std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "stream read timeout after {:?}",
+                                STREAM_READ_TIMEOUT
+                            ),
+                        );
+                        if attempt < MAX_SEGMENT_RETRIES {
+                            let delay = BASE_RETRY_DELAY_MS * 2u64.pow(attempt);
+                            warn!(
+                                req_id,
+                                worker = worker_id,
+                                segment = id,
+                                attempt,
+                                delay_ms = delay,
+                                "stream read timeout, retrying"
+                            );
+                            last_err = Some(DownloadError::Io(io_err));
+                            stream_failed = true;
+                        } else {
+                            return Err(DownloadError::Io(io_err));
+                        }
+                        break;
+                    }
                 }
             }
 
             if stream_failed {
                 continue;
+            }
+
+            let received = file_offset - start;
+            if received != size {
+                if attempt < MAX_SEGMENT_RETRIES {
+                    warn!(
+                        req_id,
+                        worker = worker_id,
+                        segment = id,
+                        received,
+                        expected = size,
+                        "incomplete segment download, retrying"
+                    );
+                    last_err = Some(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("received {received} bytes, expected {size}"),
+                    )));
+                    continue;
+                } else {
+                    error!(
+                        req_id,
+                        worker = worker_id,
+                        segment = id,
+                        received,
+                        expected = size,
+                        "incomplete segment download after retries"
+                    );
+                    return Err(DownloadError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("received {received} bytes, expected {size}"),
+                    )));
+                }
             }
 
             succeeded = true;
@@ -519,5 +625,133 @@ mod tests {
                 .unwrap_err()
         });
         assert!(is_transient_error(&err));
+    }
+
+    #[tokio::test]
+    async fn test_stream_read_timeout_retries() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use std::time::Duration;
+
+        let server = MockServer::start().await;
+        let data = vec![42u8; 256 * 1024];
+
+        Mock::given(method("GET"))
+            .and(path("/hang.dat"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-262143/262144")
+                    .set_body_bytes(&data[..128])
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let url = format!("{}/hang.dat", server.uri());
+        let buffer = create_temp_buffer(256 * 1024);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_segment_retries() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let partial = vec![0xABu8; 512];
+
+        Mock::given(method("GET"))
+            .and(path("/truncated.dat"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-1023/1024")
+                    .set_body_bytes(partial.as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/truncated.dat", server.uri());
+        let buffer = create_temp_buffer(1024);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        assert!(result.is_err());
+
+        let read = buffer.read_data(0, 1024).unwrap();
+        let mut expected_full = vec![0u8; 1024];
+        expected_full[..512].copy_from_slice(&partial);
+        assert_eq!(&read[..], &expected_full[..]);
+    }
+
+    #[tokio::test]
+    async fn test_200_instead_of_206_truncates_to_segment_size() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let full_data = vec![0x55u8; 4096];
+
+        Mock::given(method("GET"))
+            .and(path("/no-range.dat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("accept-ranges", "bytes")
+                    .set_body_bytes(full_data.as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/no-range.dat", server.uri());
+        let buffer = create_temp_buffer(2048);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        assert!(result.is_ok());
+
+        let read = buffer.read_data(0, 2048).unwrap();
+        assert_eq!(&read[..], &full_data[..2048]);
+    }
+
+    #[tokio::test]
+    async fn test_content_length_mismatch_does_not_panic() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let data = vec![0x77u8; 512];
+
+        Mock::given(method("GET"))
+            .and(path("/wrong-cl.dat"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-511/512")
+                    .set_body_bytes(data.as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/wrong-cl.dat", server.uri());
+        let buffer = create_temp_buffer(512);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, 0).await;
+        assert!(result.is_ok());
+
+        let read = buffer.read_data(0, 512).unwrap();
+        assert_eq!(&read[..], &data[..]);
     }
 }
