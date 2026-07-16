@@ -28,6 +28,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 tokio-socks = "0.5"
 base64 = "0.22"
+url = "2"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -58,6 +58,10 @@ pub fn parse_ftp_url(url: &str) -> anyhow::Result<FtpUrl> {
         (hostport.to_string(), if scheme == "ftps" { 990 } else { 21 })
     };
 
+    if host.is_empty() {
+        anyhow::bail!("empty host in FTP URL: {url}");
+    }
+
     Ok(FtpUrl { scheme, username, password, host, port, path: path.to_string() })
 }
 
@@ -162,17 +166,19 @@ pub(crate) fn parse_pasv(resp: &str) -> anyhow::Result<(String, u16)> {
     let body = resp.find('(')
         .and_then(|s| resp[s..].find(')').map(|e| &resp[s + 1..s + e]))
         .or_else(|| {
-            // No parentheses: extract digits/comma after the status code
             let after_code = resp.strip_prefix("227 ").unwrap_or(resp);
             Some(after_code)
         })
         .unwrap_or(resp);
-    let nums: Vec<u16> = body.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let nums: Vec<u8> = body
+        .split(',')
+        .map(|s| s.trim().parse::<u8>().map_err(|e| anyhow::anyhow!("invalid PASV field: {s}: {e}")))
+        .collect::<anyhow::Result<Vec<u8>>>()?;
     if nums.len() < 6 {
         anyhow::bail!("cannot parse PASV response: {resp}");
     }
     let ip = format!("{}.{}.{}.{}", nums[0], nums[1], nums[2], nums[3]);
-    let port = (nums[4] << 8) | nums[5];
+    let port = (nums[4] as u16) << 8 | nums[5] as u16;
     Ok((ip, port))
 }
 

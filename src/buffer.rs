@@ -126,10 +126,10 @@ impl SegmentsBuffer {
         let segments = self.segments.lock().unwrap();
         if let Some(seg) = segments.get(id) {
             seg.lock().unwrap().state = SegState::Ready;
+            drop(segments);
+            self.ready_count.fetch_add(1, Ordering::Release);
+            let _ = self.notify.send(id);
         }
-        drop(segments);
-        self.ready_count.fetch_add(1, Ordering::Release);
-        let _ = self.notify.send(id);
     }
 
     pub fn num_segments(&self) -> usize {
@@ -157,6 +157,9 @@ impl SegmentsBuffer {
     }
 
     pub fn read_data(&self, offset: u64, len: u64) -> Option<Bytes> {
+        if len == 0 {
+            return Some(Bytes::new());
+        }
         use std::os::unix::fs::FileExt;
         let mut buf = vec![0u8; len as usize];
         let n = self.file.read_at(&mut buf, offset).ok()?;
