@@ -654,7 +654,7 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let data_len = 10_000u64;
+        let data_len = 100_000u64;
         let data = vec![0u8; data_len as usize];
 
         Mock::given(method("GET"))
@@ -664,7 +664,7 @@ mod tests {
                     .insert_header("content-length", data_len.to_string())
                     .insert_header("accept-ranges", "bytes")
                     .set_body_bytes(data)
-                    .set_delay(std::time::Duration::from_secs(60)),
+                    .set_delay(std::time::Duration::from_millis(200)),
             )
             .mount(&server)
             .await;
@@ -675,7 +675,14 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        cancel.cancel();
+        // Cancel DURING download: send cancel after worker starts but before
+        // response arrives (mock delays 200ms). Worker will receive response,
+        // process first chunk, then detect cancel.
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
 
         let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
@@ -766,6 +773,15 @@ mod tests {
 
         let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(result.is_err());
+
+        // Verify that retry was attempted: server should have received more than 1 request
+        // (initial + at least 1 retry after timeout)
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests.len() > 1,
+            "BUG: stream timeout should trigger retry, but server only received {} request(s)",
+            requests.len()
+        );
     }
 
     #[tokio::test]
@@ -794,6 +810,15 @@ mod tests {
 
         let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
         assert!(result.is_err());
+
+        // Verify retry was attempted: server should have received more than 1 request
+        // (incomplete segment triggers retry on each attempt)
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests.len() > 1,
+            "BUG: incomplete segment should trigger retry, but server only received {} request(s)",
+            requests.len()
+        );
 
         let read = buffer.read_data(0, 1024).unwrap();
         let mut expected_full = vec![0u8; 1024];
@@ -840,6 +865,12 @@ mod tests {
         let server = MockServer::start().await;
         let data = vec![0x77u8; 512];
 
+        // Note: testing a genuine Content-Length mismatch (header says 1024, body is 512)
+        // is impossible with reqwest/hyper because hyper validates Content-Length at the
+        // protocol level and panics before the application code sees the response.
+        // This test verifies that the worker handles a missing Content-Length header
+        // gracefully — the mismatch warning path at line 299-309 is only triggered
+        // when Content-Length is present AND differs from the expected size.
         Mock::given(method("GET"))
             .and(path("/wrong-cl.dat"))
             .respond_with(
@@ -857,7 +888,7 @@ mod tests {
         let bucket = TokenBucket::unlimited();
 
         let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "worker should not panic when Content-Length is absent");
 
         let read = buffer.read_data(0, 512).unwrap();
         assert_eq!(&read[..], &data[..]);

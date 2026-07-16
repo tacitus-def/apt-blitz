@@ -369,25 +369,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_data_short_write_detection() {
-        // Open file with small capacity to test short writes
-        let dir = std::env::temp_dir().join("apt-blitz-test-buffer");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{}.download", uuid::Uuid::new_v4()));
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(10).unwrap();
+    async fn test_write_data_within_bounds() {
+        let (file, path) = create_temp_file(10);
         let (buffer, rx) = SegmentsBuffer::new(10, file, path);
-        // Try to write beyond file size — should succeed (sparse file on Unix)
-        let data = vec![0xAB; 20];
-        let res = buffer.write_data(0, &data);
-        // On Unix writing beyond EOF extends the file, so write_at should succeed
-        assert!(res.is_ok() || res.is_err());
-        // But the file size will still reflect pre-allocation
+        let data = b"0123456789";
+        buffer.write_data(0, data).unwrap();
+        let read_back = buffer.read_data(0, 10).unwrap();
+        assert_eq!(&read_back[..], data);
+        drop(rx);
+        std::fs::remove_file(buffer.file_path()).ok();
+    }
+
+    #[tokio::test]
+    async fn test_write_data_beyond_file_extends_sparse() {
+        let (file, path) = create_temp_file(10);
+        let (buffer, rx) = SegmentsBuffer::new(10, file, path);
+        // Writing 20 bytes into a 10-byte file — pwrite extends the file
+        let data = vec![0xABu8; 20];
+        buffer.write_data(0, &data).unwrap();
+        let read_back = buffer.read_data(0, 20).unwrap();
+        assert_eq!(read_back.len(), 20);
+        assert_eq!(&read_back[..], &data[..]);
         drop(rx);
         std::fs::remove_file(buffer.file_path()).ok();
     }
@@ -478,14 +480,16 @@ mod tests {
     #[tokio::test]
     async fn test_notify_broadcast_on_failed() {
         let (file, path) = create_temp_file(100);
-        let (buffer, mut rx) = SegmentsBuffer::new(100, file, path);
+        let (buffer, _rx) = SegmentsBuffer::new(100, file, path);
+        // Subscribe after creation to avoid missing the notification
+        let mut rx = buffer.subscribe();
         let buf_clone = buffer.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
             buf_clone.set_failed();
         });
         let msg = rx.recv().await;
-        assert!(msg.is_ok() || msg.is_err()); // may be lagged
+        assert!(msg.is_ok(), "failed notification must be delivered via broadcast");
     }
 
     #[tokio::test]
@@ -519,6 +523,33 @@ mod tests {
             grand_total += h.await.unwrap();
         }
         assert_eq!(grand_total, 10_000);
+
+        let segments = buffer.segments.lock().unwrap();
+        let mut ids: Vec<usize> = segments.iter().enumerate().map(|(i, _)| i).collect();
+        ids.sort();
+        assert_eq!(
+            ids.windows(2).all(|w| w[0] != w[1]),
+            true,
+            "BUG: duplicate segment ids found"
+        );
+
+        let mut ranges: Vec<(u64, u64)> = segments
+            .iter()
+            .map(|s| {
+                let seg = s.lock().unwrap();
+                (seg.start, seg.end)
+            })
+            .collect();
+        ranges.sort();
+        for window in ranges.windows(2) {
+            assert!(
+                window[0].1 <= window[1].0,
+                "BUG: overlapping ranges {:?} and {:?}",
+                window[0],
+                window[1]
+            );
+        }
+        drop(segments);
         drop(rx);
     }
 
@@ -565,9 +596,20 @@ mod tests {
     async fn test_claim_range_preferred_size_zero() {
         let (file, path) = create_temp_file(100);
         let (buffer, rx) = SegmentsBuffer::new(100, file, path);
+        // Known bug: claim_range(0) with unclaimed bytes returns None without
+        // setting all_assigned, so all_completed() can never return true.
+        // Correct behaviour: claim_range(0) should either claim the entire
+        // remaining range, or clearly signal that it's a no-op with a dedicated
+        // return value (not the same None as "exhausted").
         let r = buffer.claim_range(0);
         assert!(r.is_none());
-        assert!(!buffer.all_assigned.load(Ordering::Acquire));
+        // BUG: all_assigned should be true when total_size > 0 but preferred_size=0
+        // and there are unclaimed bytes — OR claim_range(0) should be rejected
+        // at the API level. Currently, all_completed() will never return true.
+        assert!(
+            !buffer.all_assigned.load(Ordering::Acquire),
+            "all_assigned is unexpectedly true — this documents the current (buggy) state"
+        );
         drop(rx);
     }
 
@@ -575,10 +617,14 @@ mod tests {
     async fn test_read_data_zero_length() {
         let (file, path) = create_temp_file(50);
         let (buffer, rx) = SegmentsBuffer::new(50, file, path);
-        // read_data with len=0 allocates an empty buffer; read_at returns Ok(0)
-        // which causes the function to return None
+        // Reading 0 bytes at a valid offset should return Some(empty), not None.
+        // None means EOF/error; zero-length read at valid offset is not EOF.
         let result = buffer.read_data(10, 0);
-        assert!(result.is_none());
+        assert!(
+            result.is_some(),
+            "BUG: read_data(10, 0) returned None — zero-length read at valid offset should be Some(empty)"
+        );
+        assert_eq!(result.unwrap().len(), 0);
         drop(rx);
     }
 
@@ -596,20 +642,37 @@ mod tests {
     async fn test_concurrent_write_read() {
         let (file, path) = create_temp_file(1000);
         let (buffer, rx) = SegmentsBuffer::new(1000, file, path);
+
         let buf_w = buffer.clone();
         let buf_r = buffer.clone();
-        let handle = tokio::spawn(async move {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier_w = barrier.clone();
+        let barrier_r = barrier.clone();
+
+        let writer = tokio::task::spawn_blocking(move || {
+            barrier_w.wait();
             for i in 0..10 {
                 let data = vec![i as u8; 100];
                 buf_w.write_data(i as u64 * 100, &data).unwrap();
             }
         });
-        handle.await.unwrap();
-        for i in 0..10 {
-            let data = buf_r.read_data(i as u64 * 100, 100).unwrap();
-            assert_eq!(data.len(), 100);
-            assert!(data.iter().all(|&b| b == i as u8));
-        }
+
+        let reader = tokio::task::spawn_blocking(move || {
+            barrier_r.wait();
+            for i in 0..10 {
+                let data = buf_r.read_data(i as u64 * 100, 100).unwrap();
+                assert_eq!(data.len(), 100);
+                assert!(
+                    data.iter().all(|&b| b == i as u8 || b == 0),
+                    "BUG: reader got unexpected byte value at chunk {}: {:?}",
+                    i,
+                    &data[..]
+                );
+            }
+        });
+
+        writer.await.unwrap();
+        reader.await.unwrap();
         drop(rx);
     }
 
@@ -617,9 +680,17 @@ mod tests {
     async fn test_mark_ready_invalid_id_no_panic() {
         let (file, path) = create_temp_file(100);
         let (buffer, rx) = SegmentsBuffer::new(100, file, path);
-        // mark_ready with id that doesn't exist yet
+        let count_before = buffer.ready_count.load(Ordering::Acquire);
+        // mark_ready with id that doesn't exist — must not panic and must not
+        // increment ready_count (bug: production code increments regardless).
         buffer.mark_ready(42);
         buffer.mark_ready(usize::MAX);
+        let count_after = buffer.ready_count.load(Ordering::Acquire);
+        assert_eq!(
+            count_before, count_after,
+            "BUG: ready_count incremented for non-existent segment ids ({} → {})",
+            count_before, count_after
+        );
         drop(rx);
     }
 
@@ -741,5 +812,95 @@ mod tests {
         buffer.claim_range(1024);
         assert!(buffer.all_completed());
         drop(rx);
+    }
+
+    // === Security fuzz tests ===
+    //
+    // Assertion = желаемое безопасное поведение. Падение теста = найденная дыра.
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn test_segment_start_out_of_bounds_panics_instead_of_safe_default() {
+        let (file, path) = create_temp_file(100);
+        let (buffer, _rx) = SegmentsBuffer::new(100, file, path.clone());
+        buffer.claim_range(100);
+        // Production code uses direct indexing without bounds check → panics.
+        // Correct behaviour: return 0 (safe default) or Result, not panic.
+        buffer.segment_start(999);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn test_segment_end_out_of_bounds_panics_instead_of_safe_default() {
+        let (file, path) = create_temp_file(100);
+        let (buffer, _rx) = SegmentsBuffer::new(100, file, path.clone());
+        buffer.claim_range(100);
+        // Production code uses direct indexing without bounds check → panics.
+        // Correct behaviour: return total_size (safe default) or Result, not panic.
+        buffer.segment_end(usize::MAX);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn test_read_data_offset_beyond_total_size() {
+        let (file, path) = create_temp_file(100);
+        let (buffer, _rx) = SegmentsBuffer::new(100, file, path);
+        let result = buffer.read_data(200, 10);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_write_data_offset_beyond_file_size() {
+        let (file, path) = create_temp_file(10);
+        let (buffer, _rx) = SegmentsBuffer::new(10, file, path);
+        // Запись за пределами файла — на Unix расширяет sparse file.
+        // Это не дыра, но отсутствие ограничения может привести к неконтролируемому росту.
+        let result = buffer.write_data(100, b"overflow");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_claim_range_concurrent_no_double_claim() {
+        let (file, path) = create_temp_file(1000);
+        let (buffer, _rx) = SegmentsBuffer::new(1000, file, path);
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let b = buffer.clone();
+            handles.push(tokio::spawn(async move {
+                let mut claimed = Vec::new();
+                while let Some((id, start, end)) = b.claim_range(50) {
+                    claimed.push((id, start, end));
+                }
+                claimed
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.await.unwrap());
+        }
+        all.sort_by_key(|&(_, start, _)| start);
+        for window in all.windows(2) {
+            assert_eq!(
+                window[0].2, window[1].1,
+                "BUG: segments overlap: {:?} and {:?}",
+                window[0], window[1]
+            );
+        }
+        let total: u64 = all.iter().map(|&(_, s, e)| e - s).sum();
+        assert_eq!(total, 1000);
+    }
+
+    #[test]
+    fn test_mark_all_ready_then_all_completed() {
+        let (file, path) = create_temp_file(500);
+        let (buffer, _rx) = SegmentsBuffer::new(500, file, path);
+        for _ in 0..5 {
+            buffer.claim_range(100);
+        }
+        assert!(buffer.claim_range(1).is_none());
+        assert!(!buffer.all_completed());
+        buffer.mark_all_ready();
+        assert!(buffer.all_completed());
     }
 }

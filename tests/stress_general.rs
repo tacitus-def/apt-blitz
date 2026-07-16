@@ -2,7 +2,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::TestContext;
+use common::{sha256_of, TestContext};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_workload() {
@@ -20,6 +20,8 @@ async fn mixed_workload() {
         handles.push(tokio::spawn(async move {
             let body = ctx.get_bytes(&name).await;
             assert_eq!(body.len() as u64, file_size);
+            let expected: Vec<u8> = (0..file_size).map(|j| (j % 256) as u8).collect();
+            assert_eq!(sha256_of(&body), sha256_of(&expected));
         }));
     }
 
@@ -33,6 +35,8 @@ async fn mixed_workload() {
         handles.push(tokio::spawn(async move {
             let body = ctx.get_bytes(&name).await;
             assert_eq!(body.len() as u64, file_size);
+            let expected: Vec<u8> = (0..file_size).map(|j| (j % 256) as u8).collect();
+            assert_eq!(sha256_of(&body), sha256_of(&expected));
         }));
     }
 
@@ -46,6 +50,8 @@ async fn mixed_workload() {
         handles.push(tokio::spawn(async move {
             let body = ctx.get_bytes(&name).await;
             assert_eq!(body.len() as u64, file_size);
+            let expected: Vec<u8> = (0..file_size).map(|j| (j % 256) as u8).collect();
+            assert_eq!(sha256_of(&body), sha256_of(&expected));
         }));
     }
 
@@ -58,21 +64,21 @@ async fn mixed_workload() {
 async fn graceful_shutdown() {
     let ctx = TestContext::new(1024 * 1024 * 1024).await;
 
+    // Verify the proxy handles a large download that completes normally.
+    // The original test had a timeout branch with no assertions — useless.
+    // If download completes within 30s, the proxy is working; if it hangs,
+    // the test will fail with a clear timeout error.
     let file_size = 50 * 1024 * 1024;
     ctx.upstream.register_file("/big.deb", file_size).await;
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
         ctx.get_bytes("/big.deb"),
     )
-    .await;
+    .await
+    .expect("download timed out after 30s — proxy may be stuck");
 
-    match result {
-        Ok(body) => {
-            assert_eq!(body.len() as u64, file_size);
-        }
-        Err(_timeout) => {
-            eprintln!("download cancelled (timeout) — proxy should clean up .download files on restart");
-        }
-    }
+    assert_eq!(body.len() as u64, file_size);
+    let expected: Vec<u8> = (0..file_size).map(|i| (i % 256) as u8).collect();
+    assert_eq!(sha256_of(&body), sha256_of(&expected));
 }

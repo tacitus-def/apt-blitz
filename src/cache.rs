@@ -335,6 +335,20 @@ mod tests {
         std::fs::remove_file(&stored_path).unwrap();
         let result = cache.lookup(url).await;
         assert!(result.is_none());
+        // Verify DB entry was also cleaned up
+        let hash = Cache::hash_url(url);
+        let db_exists: bool = {
+            let conn = cache.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM cache_entries WHERE url_hash = ?1",
+                [&hash],
+                |r| r.get::<_, i64>(0),
+            ).unwrap() > 0
+        };
+        assert!(
+            !db_exists,
+            "BUG: stale DB entry was not deleted after failed file existence check"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -382,6 +396,14 @@ mod tests {
         cache.store("http://example.com/b.deb", &pb, &HeaderMap::new()).await.unwrap();
         // A should be gone
         assert!(cache.lookup("http://example.com/a.deb").await.is_none());
+        // Verify A's file is also removed from disk
+        let a_hash = Cache::hash_url("http://example.com/a.deb");
+        let a_path = dir.join(format!("{}/{}", &a_hash[..2], &a_hash));
+        assert!(
+            !a_path.exists(),
+            "BUG: evicted entry's file still exists on disk at {}",
+            a_path.display()
+        );
         // B should be present
         assert!(cache.lookup("http://example.com/b.deb").await.is_some());
         std::fs::remove_dir_all(&dir).ok();
@@ -397,13 +419,12 @@ mod tests {
         let pa = temp_dir.join("z.download");
         std::fs::write(&pa, b"zero").unwrap();
         cache.store("http://example.com/z.deb", &pa, &HeaderMap::new()).await.unwrap();
-        // With max_size=0, eviction runs after every store
-        // So lookup should still find it (stored before eviction actually)
-        // Actually eviction runs after insert, so total>0 evicts it immediately
-        // But there might be a race. Let's just verify it doesn't crash.
-        // The important thing is that it doesn't panic
-        assert!(cache.lookup("http://example.com/z.deb").await.is_some() ||
-                cache.lookup("http://example.com/z.deb").await.is_none());
+        // With max_size=0, eviction must remove every entry immediately.
+        let result = cache.lookup("http://example.com/z.deb").await;
+        assert!(
+            result.is_none(),
+            "BUG: lookup returned Some after store with max_size=0 — entry should have been evicted"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -523,7 +544,7 @@ mod tests {
                 count += 1;
             }
         }
-        assert!(count <= 1, "expected at most 1 cached entry, got {}", count);
+        assert!(count == 1, "BUG: expected exactly 1 cached entry after eviction, got {} — possible off-by-one in eviction loop", count);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -558,15 +579,19 @@ mod tests {
             let conn = cache.conn.lock().unwrap();
             conn.query_row("SELECT last_access FROM cache_entries WHERE url_hash = ?1", [&hash], |r| r.get(0)).unwrap()
         };
-        // Wait and lookup again
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        // Wait >1s to guarantee different timestamp (last_access is in seconds)
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         cache.lookup(url).await.unwrap();
-        // Last access should be updated
+        // Last access must be strictly greater
         let new_access: i64 = {
             let conn = cache.conn.lock().unwrap();
             conn.query_row("SELECT last_access FROM cache_entries WHERE url_hash = ?1", [&hash], |r| r.get(0)).unwrap()
         };
-        assert!(new_access >= initial_access, "last_access should not decrease");
+        assert!(
+            new_access > initial_access,
+            "BUG: last_access was not updated (was {}, now {}). UPDATE access query may be missing or not executed.",
+            initial_access, new_access
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -637,6 +662,145 @@ mod tests {
         let (_, lookup_headers) = cache.lookup(url).await.unwrap();
         assert_eq!(lookup_headers.get("content-type").unwrap().to_str().unwrap(), "image/png");
         assert!(lookup_headers.get("content-length").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // === Security fuzz tests ===
+
+    #[tokio::test]
+    async fn test_cache_sql_injection_in_url() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-sqli");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 100_000).unwrap();
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // SQL injection attempt in URL
+        let malicious_url = "http://example.com/'; DROP TABLE cache_entries; --.deb";
+        let p = temp_dir.join("sqli.download");
+        std::fs::write(&p, b"data").unwrap();
+        cache.store(malicious_url, &p, &HeaderMap::new()).await.unwrap();
+
+        // Should be findable
+        let result = cache.lookup(malicious_url).await;
+        assert!(result.is_some());
+
+        // Table should still exist — store another entry
+        let p2 = temp_dir.join("sqli2.download");
+        std::fs::write(&p2, b"data2").unwrap();
+        cache.store("http://example.com/normal.deb", &p2, &HeaderMap::new()).await.unwrap();
+        assert!(cache.lookup("http://example.com/normal.deb").await.is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_sql_injection_in_url_select() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-sqli2");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 100_000).unwrap();
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let url = "http://example.com/ok.deb";
+        let p = temp_dir.join("ok.download");
+        std::fs::write(&p, b"data").unwrap();
+        cache.store(url, &p, &HeaderMap::new()).await.unwrap();
+
+        // SQL injection in lookup
+        let evil = "http://example.com/' OR '1'='1";
+        let result = cache.lookup(evil).await;
+        assert!(result.is_none(), "SQL injection should not return cached data");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_path_traversal_in_url() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-traversal");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 100_000).unwrap();
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let url = "http://example.com/../../../etc/passwd";
+        let p = temp_dir.join("traversal.download");
+        std::fs::write(&p, b"data").unwrap();
+        cache.store(url, &p, &HeaderMap::new()).await.unwrap();
+
+        // Cache file should be stored under SHA256 hash, not path traversal
+        let result = cache.lookup(url).await;
+        assert!(result.is_some());
+        let (path, _) = result.unwrap();
+        // Path should be within cache dir, not /etc/passwd
+        assert!(path.starts_with(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_special_chars_in_url() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-special");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 100_000).unwrap();
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let urls = vec![
+            "http://example.com/file with spaces.deb",
+            "http://example.com/file%00null.deb",
+            "http://example.com/файл.deb",
+            "http://example.com/🚀.deb",
+        ];
+        for url in &urls {
+            let p = temp_dir.join("special.download");
+            std::fs::write(&p, b"data").unwrap();
+            cache.store(url, &p, &HeaderMap::new()).await.unwrap();
+            let result = cache.lookup(url).await;
+            assert!(result.is_some(), "failed for URL: {}", url);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_concurrent_eviction_stress() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-evict-stress");
+        let _ = std::fs::remove_dir_all(&dir);
+        let max_size: u64 = 500;
+        let cache = Cache::new(dir.clone(), max_size).unwrap();
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..50 {
+            let c = cache.clone();
+            let td = temp_dir.clone();
+            handles.push(tokio::spawn(async move {
+                let url = format!("http://example.com/stress-{}.deb", i);
+                let p = td.join(format!("stress-{}.download", i));
+                std::fs::write(&p, vec![0xAA; 100]).unwrap();
+                c.store(&url, &p, &HeaderMap::new()).await.ok()
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // Verify total cached size does not exceed max_size
+        let total: i64 = {
+            let conn = cache.conn.lock().unwrap();
+            conn.query_row("SELECT COALESCE(SUM(size), 0) FROM cache_entries", [], |r| r.get(0)).unwrap()
+        };
+        assert!(
+            (total as u64) <= max_size,
+            "BUG: total cached size {} exceeds max_size {} after eviction stress",
+            total, max_size
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_lookup_nonexistent() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-lookup-miss-unique");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 10_000).unwrap();
+        assert!(cache.lookup("http://example.com/never-cached.deb").await.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

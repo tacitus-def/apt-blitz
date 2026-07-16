@@ -158,7 +158,7 @@ pub async fn check_ftp_size(url: &FtpUrl) -> anyhow::Result<u64> {
 }
 
 /// Parse PASV response: "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)"
-fn parse_pasv(resp: &str) -> anyhow::Result<(String, u16)> {
+pub(crate) fn parse_pasv(resp: &str) -> anyhow::Result<(String, u16)> {
     let body = resp.find('(')
         .and_then(|s| resp[s..].find(')').map(|e| &resp[s + 1..s + e]))
         .or_else(|| {
@@ -836,5 +836,105 @@ mod tests {
         assert!(matches!(FtpDownloadError::Ftp("err".into()), FtpDownloadError::Ftp(_)));
         assert!(matches!(FtpDownloadError::BufferFailed, FtpDownloadError::BufferFailed));
         assert!(matches!(FtpDownloadError::Cancelled, FtpDownloadError::Cancelled));
+    }
+
+    // === Security fuzz tests ===
+
+    #[test]
+    fn test_parse_ftp_url_long_path() {
+        let long_path = format!("/{}", "a".repeat(10_000));
+        let url_str = format!("ftp://host{}", long_path);
+        let u = parse_ftp_url(&url_str).unwrap();
+        assert_eq!(u.path, long_path);
+    }
+
+    #[test]
+    fn test_parse_ftp_url_special_chars_in_userinfo() {
+        let u = parse_ftp_url("ftp://us er:pa ss@host/file").unwrap();
+        assert_eq!(u.username.as_deref(), Some("us er"));
+        assert_eq!(u.password.as_deref(), Some("pa ss"));
+    }
+
+    #[test]
+    fn test_parse_ftp_url_empty_userinfo() {
+        let u = parse_ftp_url("ftp://:pass@host/file").unwrap();
+        assert_eq!(u.username.as_deref(), Some(""));
+        assert_eq!(u.password.as_deref(), Some("pass"));
+    }
+
+    #[test]
+    fn test_parse_ftp_url_only_user() {
+        let u = parse_ftp_url("ftp://user@host/file").unwrap();
+        assert_eq!(u.username.as_deref(), Some("user"));
+        assert!(u.password.is_none());
+    }
+
+    #[test]
+    fn test_parse_ftp_url_port_overflow() {
+        assert!(parse_ftp_url("ftp://host:99999/path").is_err());
+    }
+
+    #[test]
+    fn test_parse_ftp_url_negative_port() {
+        assert!(parse_ftp_url("ftp://host:-1/path").is_err());
+    }
+
+    #[test]
+    fn test_parse_pasv_zero_values() {
+        let (ip, port) = parse_pasv("227 (0,0,0,0,0,0)").unwrap();
+        assert_eq!(ip, "0.0.0.0");
+        assert_eq!(port, 0);
+    }
+
+    #[test]
+    fn test_parse_pasv_non_numeric() {
+        assert!(parse_pasv("227 (a,b,c,d,e,f)").is_err());
+    }
+
+    #[test]
+    fn test_parse_pasv_overflow_values() {
+        // Values > 255 in PASV are invalid per RFC 959 (each field is 0-255).
+        // The parser should reject them to prevent malformed PASV responses from
+        // being accepted. This test asserts the correct secure behaviour.
+        let result = parse_pasv("227 (300,400,500,600,700,800)");
+        assert!(
+            result.is_err(),
+            "BUG: parse_pasv accepts values >255 — RFC 959 requires each field to be 0-255"
+        );
+    }
+
+    #[test]
+    fn test_parse_pasv_mixed_non_numeric() {
+        // Mixed non-numeric values should be rejected, not silently dropped.
+        // Current parser uses filter_map which silently drops non-numeric tokens:
+        // "227 (1,2,3,4,5,abc,6)" → [1,2,3,4,5,6] → accepted (bug).
+        let result = parse_pasv("227 (1,2,3,4,5,abc,6)");
+        assert!(
+            result.is_err(),
+            "BUG: parse_pasv silently drops non-numeric PASV fields — should reject"
+        );
+    }
+
+    #[test]
+    fn test_parse_ftp_url_empty_host() {
+        // Empty host in FTP URL should be rejected
+        let result = parse_ftp_url("ftp:///path/to/file");
+        assert!(
+            result.is_err(),
+            "BUG: parse_ftp_url accepts empty host"
+        );
+    }
+
+    #[test]
+    fn test_parse_ftp_url_double_slash_in_path() {
+        let u = parse_ftp_url("ftp://host//double//slashes").unwrap();
+        assert_eq!(u.path, "//double//slashes");
+    }
+
+    #[test]
+    #[ignore = "known issue: path traversal through /../ in FTP URL is not resolved by the parser"]
+    fn test_parse_ftp_url_dot_segments() {
+        let u = parse_ftp_url("ftp://host/path/../secret").unwrap();
+        assert_eq!(u.path, "/path/../secret");
     }
 }

@@ -467,6 +467,16 @@ mod tests {
             let map = limiter.per_ip.lock().await;
             assert!(!map.contains_key(&ip));
         }
+
+        // After sweep, a new acquire must create a fresh semaphore
+        let _new_permit = limiter.acquire(ip).await.unwrap();
+        {
+            let map = limiter.per_ip.lock().await;
+            assert!(
+                map.contains_key(&ip),
+                "BUG: new acquire after sweep did not create a fresh semaphore entry"
+            );
+        }
     }
 
     #[tokio::test]
@@ -498,6 +508,17 @@ mod tests {
         {
             let map = limiter.per_ip_buckets.lock().await;
             assert!(!map.contains_key(&ip));
+        }
+
+        // After sweep, a new acquire must create a fresh bucket with full balance
+        let _new_permit = limiter.acquire(ip).await.unwrap();
+        {
+            let map = limiter.per_ip_buckets.lock().await;
+            let bucket = map.get(&ip).expect("new acquire after sweep did not create a fresh bucket");
+            assert!(
+                bucket.0.available() > 0,
+                "BUG: new bucket after sweep has no tokens — should start full"
+            );
         }
     }
 
@@ -543,6 +564,11 @@ mod tests {
         }
         assert_eq!(total, 10_000);
         assert_eq!(b.available(), 0);
+        // After all tokens consumed, try_consume must return false
+        assert!(
+            !b.try_consume(1),
+            "BUG: try_consume(1) returned true when available() == 0 — CAS loop may be broken"
+        );
     }
 
     #[tokio::test]
@@ -569,7 +595,10 @@ mod tests {
             total += h.await.unwrap();
         }
 
+        // refill_rate = 1000/s, after 50ms ≈ 50 tokens available
+        // 50 tasks × 10 tokens each = could consume up to 500, but only ~50 available
         assert!(total > 0, "should have consumed some tokens after refill");
+        assert!(total <= 1000, "consumed {} tokens exceeds max capacity 1000 — possible over-consumption bug", total);
         assert!(b.available() <= 1000, "tokens must never exceed max");
     }
 }
