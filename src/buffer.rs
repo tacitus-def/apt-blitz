@@ -605,23 +605,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_claim_range_preferred_size_zero() {
+    async fn test_claim_range_preferred_size_zero_is_noop() {
         let (file, path) = create_temp_file(100);
         let (buffer, rx) = SegmentsBuffer::new(100, file, path);
-        // Known bug: claim_range(0) with unclaimed bytes returns None without
-        // setting all_assigned, so all_completed() can never return true.
-        // Correct behaviour: claim_range(0) should either claim the entire
-        // remaining range, or clearly signal that it's a no-op with a dedicated
-        // return value (not the same None as "exhausted").
         let r = buffer.claim_range(0);
         assert!(r.is_none());
-        // BUG: all_assigned should be true when total_size > 0 but preferred_size=0
-        // and there are unclaimed bytes — OR claim_range(0) should be rejected
-        // at the API level. Currently, all_completed() will never return true.
-        assert!(
-            !buffer.all_assigned.load(Ordering::Acquire),
-            "all_assigned is unexpectedly true — this documents the current (buggy) state"
-        );
+        assert!(!buffer.all_assigned.load(Ordering::Acquire));
+        assert_eq!(buffer.num_segments(), 0);
+        let r2 = buffer.claim_range(50);
+        assert!(r2.is_some());
         drop(rx);
     }
 
@@ -693,15 +685,12 @@ mod tests {
         let (file, path) = create_temp_file(100);
         let (buffer, rx) = SegmentsBuffer::new(100, file, path);
         let count_before = buffer.ready_count.load(Ordering::Acquire);
-        // mark_ready with id that doesn't exist — must not panic and must not
-        // increment ready_count (bug: production code increments regardless).
         buffer.mark_ready(42);
         buffer.mark_ready(usize::MAX);
         let count_after = buffer.ready_count.load(Ordering::Acquire);
         assert_eq!(
             count_before, count_after,
-            "BUG: ready_count incremented for non-existent segment ids ({} → {})",
-            count_before, count_after
+            "ready_count must not change for non-existent segment ids"
         );
         drop(rx);
     }
