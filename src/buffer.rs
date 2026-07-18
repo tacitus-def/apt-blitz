@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use tokio::sync::{broadcast, watch};
 use http::{HeaderMap, StatusCode};
+use tracing::warn;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SegState {
@@ -146,14 +147,22 @@ impl SegmentsBuffer {
 
     pub fn segment_start(&self, id: usize) -> u64 {
         let segments = self.segments.lock().unwrap();
-        let seg = segments[id].lock().unwrap();
-        seg.start
+        let Some(seg) = segments.get(id) else {
+            warn!("segment_start({id}): index out of bounds (segments len={})", segments.len());
+            return 0;
+        };
+        let start = seg.lock().unwrap().start;
+        start
     }
 
     pub fn segment_end(&self, id: usize) -> u64 {
         let segments = self.segments.lock().unwrap();
-        let seg = segments[id].lock().unwrap();
-        seg.end
+        let Some(seg) = segments.get(id) else {
+            warn!("segment_end({id}): index out of bounds (segments len={})", segments.len());
+            return self.total_size;
+        };
+        let end = seg.lock().unwrap().end;
+        end
     }
 
     pub fn read_data(&self, offset: u64, len: u64) -> Option<Bytes> {
@@ -822,27 +831,21 @@ mod tests {
     // Assertion = желаемое безопасное поведение. Падение теста = найденная дыра.
 
     #[test]
-    #[should_panic(expected = "index out of bounds")]
-    fn test_segment_start_out_of_bounds_panics_instead_of_safe_default() {
+    fn test_segment_start_out_of_bounds_returns_zero() {
         let (file, path) = create_temp_file(100);
-        let (buffer, _rx) = SegmentsBuffer::new(100, file, path.clone());
+        let (buffer, _rx) = SegmentsBuffer::new(100, file, path);
         buffer.claim_range(100);
-        // Production code uses direct indexing without bounds check → panics.
-        // Correct behaviour: return 0 (safe default) or Result, not panic.
-        buffer.segment_start(999);
-        std::fs::remove_file(path).ok();
+        assert_eq!(buffer.segment_start(999), 0);
+        assert_eq!(buffer.segment_start(usize::MAX), 0);
     }
 
     #[test]
-    #[should_panic(expected = "index out of bounds")]
-    fn test_segment_end_out_of_bounds_panics_instead_of_safe_default() {
+    fn test_segment_end_out_of_bounds_returns_total_size() {
         let (file, path) = create_temp_file(100);
-        let (buffer, _rx) = SegmentsBuffer::new(100, file, path.clone());
+        let (buffer, _rx) = SegmentsBuffer::new(100, file, path);
         buffer.claim_range(100);
-        // Production code uses direct indexing without bounds check → panics.
-        // Correct behaviour: return total_size (safe default) or Result, not panic.
-        buffer.segment_end(usize::MAX);
-        std::fs::remove_file(path).ok();
+        assert_eq!(buffer.segment_end(999), 100);
+        assert_eq!(buffer.segment_end(usize::MAX), 100);
     }
 
     #[test]

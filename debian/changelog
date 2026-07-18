@@ -1,3 +1,10 @@
+apt-blitz (0.6.1-1) unstable; urgency=medium
+
+  * Resolve 22 failing tests: buffer, proxy, FTP bugs.
+  * Detect real bugs in tests, add SHA256 checks, fix flaky races.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Sat, 19 Jul 2026 00:00:00 +0300
+
 apt-blitz (0.6.0-1) unstable; urgency=medium
 
   * Start with 1 worker instead of 4 to avoid overwhelming slow servers.

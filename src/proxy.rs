@@ -2035,7 +2035,7 @@ mod tests {
     }
 
     // --- Block 6: Паники — segment_start/end не должны паниковать ---
-    // Тесты segment_start/segment_end OOB уже в buffer.rs (test_segment_*_out_of_bounds_must_not_panic)
+    // Тесты segment_start/segment_end OOB уже в buffer.rs (test_segment_*_out_of_bounds_returns_*)
 
     // --- Block 1: CLI — UpstreamProxy::parse должен отклонять пустой host ---
 
