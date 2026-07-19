@@ -1,3 +1,12 @@
+apt-blitz (0.7.4-1) unstable; urgency=medium
+
+  * Configurable coalesce follower timeout and max retries.
+  * Replace retry loop with single long-wait for in-flight downloads.
+  * Fix all clippy warnings.
+  * Fix OOB tests and consistent 400/502 error responses.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Sat, 19 Jul 2026 12:00:00 +0300
+
 apt-blitz (0.6.1-1) unstable; urgency=medium
 
   * Resolve 22 failing tests: buffer, proxy, FTP bugs.

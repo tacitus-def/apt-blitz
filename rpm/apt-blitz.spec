@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.6.1
+Version:    0.7.4
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -10,7 +10,7 @@ License:    MIT
 URL:        https://github.com/tacitus-def/apt-blitz
 Source0:    %{name}-%{version}.tar.gz
 BuildRequires:  cargo, rust, openssl-devel
-Requires:       systemd
+%{?systemd_requires}
 
 %description
 apt-blitz is an HTTP forward proxy designed for APT.

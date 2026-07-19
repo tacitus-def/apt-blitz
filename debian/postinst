@@ -3,7 +3,6 @@ set -e
 
 case "$1" in
     configure)
-        # Create system user if it doesn't exist
         if ! getent passwd apt-blitz > /dev/null 2>&1; then
             adduser --system --group --quiet --no-create-home \
                 --home /var/cache/apt-blitz \
