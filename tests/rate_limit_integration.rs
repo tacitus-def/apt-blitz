@@ -22,6 +22,8 @@ fn base_config() -> Config {
         max_workers: 0,
         upstream_bandwidth: 0,
         per_ip_bandwidth: 0,
+        coalesce_follower_timeout_secs: 50,
+        coalesce_max_retries: 3,
     }
 }
 

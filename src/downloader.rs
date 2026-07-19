@@ -58,6 +58,7 @@ impl From<std::io::Error> for DownloadError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_one_worker(
     id: usize,
     client: &reqwest::Client,
@@ -101,6 +102,7 @@ fn spawn_one_worker(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn download_multithreaded(
     client: &reqwest::Client,
     url: &str,
@@ -204,6 +206,7 @@ pub async fn download_multithreaded(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_worker(
     client: &reqwest::Client,
     url: &str,

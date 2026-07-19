@@ -136,7 +136,7 @@ impl Cache {
 
     pub async fn store(&self, url: &str, temp_path: &Path, headers: &HeaderMap) -> anyhow::Result<PathBuf> {
         let hash = Self::hash_url(url);
-        let file_name = format!("{}/{}", &hash[..2], &hash);
+        let file_name = format!("{}/{}", &hash[..2], hash);
         let final_path = self.dir.join(&file_name);
 
         if let Some(parent) = final_path.parent() {

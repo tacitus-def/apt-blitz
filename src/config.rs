@@ -204,6 +204,8 @@ pub struct Config {
     pub max_workers: usize,
     pub upstream_bandwidth: u64,
     pub per_ip_bandwidth: u64,
+    pub coalesce_follower_timeout_secs: u64,
+    pub coalesce_max_retries: u32,
 }
 
 /// Raw YAML representation — all fields optional (file provides defaults)
@@ -225,6 +227,8 @@ struct YamlConfig {
     upstream_bandwidth: Option<u64>,
     #[serde(default, with = "serde_bytes_option")]
     per_ip_bandwidth: Option<u64>,
+    coalesce_follower_timeout_secs: Option<u64>,
+    coalesce_max_retries: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +290,14 @@ struct Cli {
     #[arg(long, default_value = "0", env = "PROXY_PER_IP_BANDWIDTH",
           value_parser = parse_bytes_value)]
     per_ip_bandwidth: u64,
+
+    /// Timeout (seconds) for a follower waiting for an in-flight download buffer
+    #[arg(long, default_value_t = 50, env = "PROXY_COALESCE_FOLLOWER_TIMEOUT_SECS")]
+    coalesce_follower_timeout_secs: u64,
+
+    /// Max retries when leader drops the download before attaching a buffer
+    #[arg(long, default_value_t = 3, env = "PROXY_COALESCE_MAX_RETRIES")]
+    coalesce_max_retries: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +355,8 @@ impl Config {
             max_workers: cli.max_workers,
             upstream_bandwidth: cli.upstream_bandwidth,
             per_ip_bandwidth: cli.per_ip_bandwidth,
+            coalesce_follower_timeout_secs: cli.coalesce_follower_timeout_secs,
+            coalesce_max_retries: cli.coalesce_max_retries,
         })
     }
 
@@ -428,6 +442,8 @@ impl YamlConfig {
         set!("MAX_WORKERS", self.max_workers);
         set!("UPSTREAM_BANDWIDTH", self.upstream_bandwidth);
         set!("PER_IP_BANDWIDTH", self.per_ip_bandwidth);
+        set!("COALESCE_FOLLOWER_TIMEOUT_SECS", self.coalesce_follower_timeout_secs);
+        set!("COALESCE_MAX_RETRIES", self.coalesce_max_retries);
     }
 }
 
@@ -435,7 +451,7 @@ impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {}, max_connections_per_ip: {}, max_total_connections: {}, max_workers: {}, upstream_bandwidth: {}, per_ip_bandwidth: {} }}",
+            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {}, max_connections_per_ip: {}, max_total_connections: {}, max_workers: {}, upstream_bandwidth: {}, per_ip_bandwidth: {}, coalesce_follower_timeout_secs: {}, coalesce_max_retries: {} }}",
             self.port,
             self.bind,
             self.connections,
@@ -449,6 +465,8 @@ impl std::fmt::Display for Config {
             self.max_workers,
             self.upstream_bandwidth,
             self.per_ip_bandwidth,
+            self.coalesce_follower_timeout_secs,
+            self.coalesce_max_retries,
         )
     }
 }
@@ -517,6 +535,8 @@ mod tests {
         assert_eq!(cli.port, 8080);
         assert!(cli.config_file.is_none());
         assert!(cli.url_map.is_empty());
+        assert_eq!(cli.coalesce_follower_timeout_secs, 50);
+        assert_eq!(cli.coalesce_max_retries, 3);
     }
 
     #[test]
@@ -653,6 +673,8 @@ no_proxy:
             max_workers: 0,
             upstream_bandwidth: 0,
             per_ip_bandwidth: 0,
+            coalesce_follower_timeout_secs: 50,
+            coalesce_max_retries: 3,
         };
         let s = format!("{cfg}");
         assert!(s.contains("8080"));
@@ -719,6 +741,8 @@ no_proxy:
             max_workers: 0,
             upstream_bandwidth: 0,
             per_ip_bandwidth: 0,
+            coalesce_follower_timeout_secs: 50,
+            coalesce_max_retries: 3,
         };
         let output = cfg.to_string();
         assert!(output.contains("port: 8080"));
@@ -752,6 +776,8 @@ no_proxy:
             max_workers: None,
             upstream_bandwidth: None,
             per_ip_bandwidth: None,
+            coalesce_follower_timeout_secs: None,
+            coalesce_max_retries: None,
         };
         yaml.apply_env();
 

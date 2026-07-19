@@ -43,11 +43,7 @@ impl TokenBucket {
     /// * `max_tokens` — burst capacity in bytes.
     /// * `refill_per_sec` — sustained rate in bytes/sec.
     pub fn new(max_tokens: u64, refill_per_sec: u64) -> Self {
-        let refill_rate_nanos = if refill_per_sec == 0 {
-            0
-        } else {
-            NANOS_PER_SEC / refill_per_sec
-        };
+        let refill_rate_nanos = NANOS_PER_SEC.checked_div(refill_per_sec).unwrap_or(0);
         Self {
             inner: Arc::new(TokenBucketInner {
                 tokens: AtomicU64::new(max_tokens),
@@ -286,14 +282,14 @@ impl IpRateLimiter {
             let mut map = self.per_ip.lock().await;
             map.retain(|_, (_, last_used)| {
                 now.checked_duration_since(*last_used)
-                    .map_or(true, |d| d < MAP_ENTRY_TTL)
+                    .is_none_or(|d| d < MAP_ENTRY_TTL)
             });
         }
         {
             let mut map = self.per_ip_buckets.lock().await;
             map.retain(|_, (_, last_used)| {
                 now.checked_duration_since(*last_used)
-                    .map_or(true, |d| d < MAP_ENTRY_TTL)
+                    .is_none_or(|d| d < MAP_ENTRY_TTL)
             });
         }
     }

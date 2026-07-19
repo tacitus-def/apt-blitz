@@ -181,7 +181,7 @@ async fn handle_connection(
             let (parts, incoming) = req.into_parts();
             let stream = incoming
                 .into_data_stream()
-                .map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+                .map(|r| r.map_err(std::io::Error::other));
             let body = axum::body::Body::from_stream(stream);
             let mut axum_req = axum::http::Request::from_parts(parts, body);
             axum_req.extensions_mut().insert(peer);

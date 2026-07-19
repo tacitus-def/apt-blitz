@@ -24,6 +24,12 @@ pub enum RegisterResult {
     FollowerBuffer(Arc<SegmentsBuffer>),
 }
 
+impl Default for Coalescer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Coalescer {
     pub fn new() -> Self {
         Self {

@@ -141,7 +141,7 @@ impl SegmentsBuffer {
 
     pub fn is_ready(&self, id: usize) -> bool {
         let segments = self.segments.lock().unwrap();
-        segments.get(id).map_or(false, |s| {
+        segments.get(id).is_some_and(|s| {
             let seg = s.lock().unwrap();
             seg.state == SegState::Ready
         })

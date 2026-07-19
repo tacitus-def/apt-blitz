@@ -29,6 +29,7 @@ use crate::downloader::download_multithreaded;
 
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug)]
 enum CoalesceOutcome {
     Cached { path: std::path::PathBuf, headers: HeaderMap },
     FollowerBuffer(Arc<SegmentsBuffer>),
@@ -43,6 +44,12 @@ const MAX_FAILURE_ENTRIES: usize = 10_000;
 
 pub struct FailureTracker {
     failures: Mutex<HashMap<String, (u32, Instant)>>,
+}
+
+impl Default for FailureTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FailureTracker {
@@ -107,6 +114,7 @@ fn copy_forward_headers(from: &HeaderMap, to: &mut HeaderMap) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
     download_handle: tokio::task::JoinHandle<Result<(), E>>,
     buffer: Arc<SegmentsBuffer>,
@@ -161,14 +169,11 @@ async fn resolve_with_coalescing(
     coalescer: &Coalescer,
     failure_tracker: &FailureTracker,
     req_id: u64,
+    follower_timeout: Duration,
+    max_retries: u32,
 ) -> Result<CoalesceOutcome, ProxyError> {
     let mut retries = 0u32;
     loop {
-        if retries >= 5 {
-            return Err(ProxyError::Internal("too many retries waiting for in-flight download".into()));
-        }
-        retries += 1;
-
         if failure_tracker.is_in_cooldown(url) {
             warn!(req_id, url = %url, "upstream in failure cooldown, rejecting");
             return Err(ProxyError::Internal(format!(
@@ -184,14 +189,24 @@ async fn resolve_with_coalescing(
         match coalescer.register(url) {
             RegisterResult::Follower(rx) => {
                 info!(req_id, "joining in-flight download as follower");
-                let buffer = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-                    Ok(Ok(buf)) => buf,
-                    _ => {
-                        info!(req_id, "follower wait failed, retrying");
+                match tokio::time::timeout(follower_timeout, rx).await {
+                    Ok(Ok(buf)) => return Ok(CoalesceOutcome::FollowerBuffer(buf)),
+                    Ok(Err(_)) => {
+                        retries += 1;
+                        if retries > max_retries {
+                            return Err(ProxyError::Internal(format!(
+                                "leader failed {} times for {}, giving up", retries, url
+                            )));
+                        }
+                        info!(req_id, retries, "leader dropped download, retrying");
                         continue;
                     }
-                };
-                return Ok(CoalesceOutcome::FollowerBuffer(buffer));
+                    Err(_) => {
+                        return Err(ProxyError::Internal(format!(
+                            "timed out waiting for in-flight download of {}", url
+                        )));
+                    }
+                }
             }
             RegisterResult::FollowerBuffer(buffer) => {
                 info!(req_id, "joining completed in-flight download");
@@ -305,6 +320,18 @@ impl IntoResponse for ProxyError {
     }
 }
 
+impl std::fmt::Display for ProxyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProxyError::BadRequest(s) => write!(f, "bad request: {s}"),
+            ProxyError::Upstream(e) => write!(f, "upstream error: {e}"),
+            ProxyError::BadGateway(s) => write!(f, "bad gateway: {s}"),
+            ProxyError::Internal(s) => write!(f, "{s}"),
+            ProxyError::TooManyRequests => write!(f, "too many requests"),
+        }
+    }
+}
+
 impl From<reqwest::Error> for ProxyError {
     fn from(e: reqwest::Error) -> Self {
         ProxyError::Upstream(e)
@@ -347,7 +374,7 @@ impl<S> ThrottledPermitStream<S> {
 
     fn try_deliver(&mut self) -> Poll<Option<Result<bytes::Bytes, std::io::Error>>> {
         if let Some(ref bucket) = self.bucket {
-            while let Some(front) = self.pending.front() {
+            if let Some(front) = self.pending.front() {
                 let len = front.len() as u64;
                 if bucket.try_consume(len) {
                     let chunk = self.pending.pop_front().unwrap();
@@ -476,7 +503,7 @@ fn wrap_response_with_permit(resp: Response, permit: IpPermit, cancel: Cancellat
     let (parts, body) = resp.into_parts();
     let per_ip_bucket = permit.per_ip_bucket.clone();
     let stream = body.into_data_stream();
-    let mapped = stream.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let mapped = stream.map(|r| r.map_err(std::io::Error::other));
     let wrapped = ThrottledPermitStream {
         inner: mapped,
         _permit: permit,
@@ -574,7 +601,7 @@ async fn handle_proxy_inner(
         return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
-    match resolve_with_coalescing(&url, &state.cache, &state.coalescer, &state.failure_tracker, req_id).await? {
+    match resolve_with_coalescing(&url, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries).await? {
         CoalesceOutcome::Cached { path, headers } => {
             let resp = serve_file(&path, &headers).await?;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
@@ -639,6 +666,7 @@ async fn handle_proxy_inner(
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&temp_path)
         .map_err(|e| ProxyError::Internal(format!("failed to create temp file: {e}")))?;
     temp_file.set_len(total_size).map_err(|e| {
@@ -702,7 +730,7 @@ async fn handle_proxy_inner(
 async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Response, ProxyError> {
     info!(req_id, "ftp request");
 
-    match resolve_with_coalescing(url, &state.cache, &state.coalescer, &state.failure_tracker, req_id).await? {
+    match resolve_with_coalescing(url, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries).await? {
         CoalesceOutcome::Cached { path, headers } => {
             return serve_file(&path, &headers).await;
         }
@@ -728,6 +756,7 @@ async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Re
         .read(true)
         .write(true)
         .create(true)
+        .truncate(true)
         .open(&temp_path)
         .map_err(|e| ProxyError::Internal(format!("failed to create temp file: {e}")))?;
     temp_file.set_len(total_size).map_err(|e| {
@@ -814,10 +843,7 @@ fn make_buffer_stream(
                 }
                 state.errored = true;
                 return Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "download failed",
-                    )),
+                    Err(std::io::Error::other("download failed")),
                     state,
                 ));
             }
@@ -900,17 +926,13 @@ async fn plain_proxy(
                 Ok(chunk) => {
                     let len = chunk.len() as u64;
                     if !bucket.try_consume(len) {
-                        return Some(Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        return Some(Err(std::io::Error::other(
                             "upstream bandwidth limit exceeded",
                         )));
                     }
                     Some(Ok(chunk))
                 }
-                Err(e) => Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e,
-                ))),
+                Err(e) => Some(Err(std::io::Error::other(e))),
             }
         }
     });
@@ -2036,8 +2058,126 @@ mod tests {
         }
     }
 
-}
+    fn make_test_buffer(size: u64) -> Arc<crate::buffer::SegmentsBuffer> {
+        let dir = std::env::temp_dir().join("apt-blitz-test-coalesce-proxy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.download", uuid::Uuid::new_v4()));
+        let file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).open(&path).unwrap();
+        let (buf, _rx) = crate::buffer::SegmentsBuffer::new(size, file, path);
+        buf
+    }
 
+    // --- resolve_with_coalescing tests ---
+
+    #[tokio::test]
+    async fn test_coalesce_follower_receives_buffer_within_timeout() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(std::env::temp_dir().join("apt-blitz-test-coalesce-ok"), 1024 * 1024).unwrap();
+        let tracker = FailureTracker::new();
+        let url = "http://example.com/follower-ok.bin";
+
+        coalescer.register(url);
+        let buffer = make_test_buffer(1024);
+        coalescer.attach_buffer(url, buffer.clone());
+
+        let result = resolve_with_coalescing(
+            url, &cache, &coalescer, &tracker, 1,
+            Duration::from_secs(5), 3,
+        ).await.unwrap();
+
+        match result {
+            CoalesceOutcome::FollowerBuffer(b) => assert!(Arc::ptr_eq(&b, &buffer)),
+            other => panic!("expected FollowerBuffer, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_leader_drop_triggers_retry_then_leader() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(std::env::temp_dir().join("apt-blitz-test-coalesce-retry"), 1024 * 1024).unwrap();
+        let tracker = FailureTracker::new();
+        let url = "http://example.com/leader-drop.bin";
+
+        coalescer.register(url);
+        coalescer.fail(url);
+
+        let result = resolve_with_coalescing(
+            url, &cache, &coalescer, &tracker, 1,
+            Duration::from_millis(100), 3,
+        ).await.unwrap();
+
+        assert!(matches!(result, CoalesceOutcome::Leader));
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_timeout_returns_error() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(std::env::temp_dir().join("apt-blitz-test-coalesce-timeout"), 1024 * 1024).unwrap();
+        let tracker = FailureTracker::new();
+        let url = "http://example.com/timeout.bin";
+
+        coalescer.register(url);
+
+        let result = resolve_with_coalescing(
+            url, &cache, &coalescer, &tracker, 1,
+            Duration::from_millis(50), 0,
+        ).await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("timed out"), "expected timeout error, got: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_leader_drop_exceeds_max_retries() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(std::env::temp_dir().join("apt-blitz-test-coalesce-maxretry"), 1024 * 1024).unwrap();
+        let tracker = FailureTracker::new();
+        let url = "http://example.com/maxretry.bin";
+
+        coalescer.register(url);
+
+        let coalescer_clone = coalescer.clone();
+        let url_clone = url.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            coalescer_clone.fail(&url_clone);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            coalescer_clone.register(&url_clone);
+            coalescer_clone.fail(&url_clone);
+        });
+
+        let result = resolve_with_coalescing(
+            url, &cache, &coalescer, &tracker, 1,
+            Duration::from_millis(100), 1,
+        ).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_coalesce_cooldown_blocks_immediately() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(std::env::temp_dir().join("apt-blitz-test-coalesce-cooldown"), 1024 * 1024).unwrap();
+        let tracker = FailureTracker::new();
+        let url = "http://example.com/cooldown.bin";
+
+        for _ in 0..MAX_FAILURES_BEFORE_COOLDOWN {
+            tracker.record_failure(url);
+        }
+
+        let result = resolve_with_coalescing(
+            url, &cache, &coalescer, &tracker, 1,
+            Duration::from_secs(5), 3,
+        ).await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("cooldown"), "expected cooldown error, got: {err_msg}");
+    }
+
+}
 /// Check if a host should bypass the upstream proxy according to NO_PROXY rules.
 /// Supports:
 /// - `*` (bypass all)
@@ -2072,7 +2212,7 @@ pub fn no_proxy_match(host: &str, no_proxy: &[String]) -> bool {
                     // For 10.0.0.0/8, check if host starts with "10."
                     let dotted = cidr_base.split('.').collect::<Vec<_>>();
                     let bits: u8 = rule.split('/').nth(1).and_then(|s| s.parse().ok()).unwrap_or(32);
-                    let num_octets = (bits as usize + 7) / 8;
+                    let num_octets = (bits as usize).div_ceil(8);
                     let prefix = dotted[..num_octets.min(dotted.len())].join(".");
                     if host.starts_with(&prefix) {
                         return true;
@@ -2147,7 +2287,7 @@ pub(crate) async fn handle_connect_tunnel(
                 warn!(%host, port, error = %e, "CONNECT upstream connect failed");
                 let _ = stream
                     .write_all(
-                        format!("HTTP/1.1 502 Bad Gateway\r\n\r\n").as_bytes(),
+                        b"HTTP/1.1 502 Bad Gateway\r\n\r\n",
                     )
                     .await;
                 return;
@@ -2166,9 +2306,7 @@ pub(crate) async fn handle_connect_tunnel(
             Ok((a, b)) => info!(client_to_server = a, server_to_client = b, "CONNECT tunnel closed"),
             Err(e) => warn!("CONNECT tunnel error: {e}"),
         }
-    } else {
-        // Use upstream proxy
-        let proxy = upstream_proxy.unwrap();
+    } else if let Some(proxy) = upstream_proxy {
         match proxy.proxy_type {
             ProxyType::Socks5 => {
                 use tokio_socks::tcp::Socks5Stream;

@@ -76,7 +76,7 @@ pub fn parse_ftp_url(url: &str) -> anyhow::Result<FtpUrl> {
         anyhow::bail!("empty host in FTP URL: {url}");
     }
 
-    Ok(FtpUrl { scheme, username, password, host, port, path: normalize_ftp_path(&path) })
+    Ok(FtpUrl { scheme, username, password, host, port, path: normalize_ftp_path(path) })
 }
 
 // ---- minimal FTP control connection ----
@@ -196,6 +196,7 @@ pub(crate) fn parse_pasv(resp: &str) -> anyhow::Result<(String, u16)> {
     Ok((ip, port))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn download_range(
     ftp: &mut FtpControl,
     data_addr: (String, u16),

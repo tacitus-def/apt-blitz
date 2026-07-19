@@ -1,7 +1,5 @@
 //! Entrypoint: CLI parsing, tracing init, server startup.
 
-use tracing_subscriber;
-
 use apt_blitz::config::Config;
 use apt_blitz::run_proxy;
 
