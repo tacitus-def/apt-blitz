@@ -1,2 +1,3 @@
 target/release/apt-blitz usr/bin
 debian/apt-blitz.default etc/default/apt-blitz
+debian/init.d/apt-blitz etc/init.d/apt-blitz

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ] && command -v systemctl > /dev/null 2>&1; then
+            if systemctl is-active --quiet apt-blitz.service 2>/dev/null; then
+                systemctl stop apt-blitz.service || true
+            fi
+        elif [ -x /etc/init.d/apt-blitz ]; then
+            /etc/init.d/apt-blitz stop || true
+        fi
+        ;;
+    upgrade)
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -1,0 +1,121 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          apt-blitz
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: APT proxy with multithreaded downloading
+# Description:       apt-blitz is an HTTP forward proxy that speeds up
+#                    APT package downloads via concurrent Range requests.
+### END INIT INFO
+
+NAME="apt-blitz"
+DAEMON="/usr/bin/apt-blitz"
+PIDFILE="/run/${NAME}.pid"
+LOGFILE="/var/log/${NAME}.log"
+DEFAULTFILE="/etc/default/${NAME}"
+DESC="APT proxy with multithreaded downloading"
+
+. /lib/lsb/init-functions
+
+load_defaults() {
+    ARGS=""
+    if [ -f "$DEFAULTFILE" ]; then
+        . "$DEFAULTFILE"
+    fi
+}
+
+do_start() {
+    load_defaults
+    if [ -f "$PIDFILE" ]; then
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            log_warning_msg "${NAME} is already running (pid ${pid})"
+            return 0
+        fi
+        rm -f "$PIDFILE"
+    fi
+
+    start-stop-daemon --start --quiet --background \
+        --make-pidfile --pidfile "$PIDFILE" \
+        --exec "$DAEMON" -- $ARGS
+    RETVAL=$?
+    if [ $RETVAL -eq 0 ]; then
+        log_daemon_msg "Starting ${DESC}" "${NAME}"
+        log_end_msg 0
+    else
+        log_daemon_msg "Starting ${DESC}" "${NAME}"
+        log_end_msg 1
+    fi
+    return $RETVAL
+}
+
+do_stop() {
+    if [ ! -f "$PIDFILE" ]; then
+        log_warning_msg "${NAME} is not running (no pidfile)"
+        return 0
+    fi
+
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        log_warning_msg "${NAME} is not running (stale pidfile)"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+
+    log_daemon_msg "Stopping ${DESC}" "${NAME}"
+    kill "$pid"
+    for i in $(seq 1 10); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$PIDFILE"
+            log_end_msg 0
+            return 0
+        fi
+        sleep 1
+    done
+
+    kill -KILL "$pid" 2>/dev/null
+    rm -f "$PIDFILE"
+    log_end_msg 0
+    return 0
+}
+
+do_status() {
+    if [ ! -f "$PIDFILE" ]; then
+        log_success_msg "${NAME} is not running"
+        return 3
+    fi
+
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        log_success_msg "${NAME} is running (pid ${pid})"
+        return 0
+    fi
+
+    log_failure_msg "${NAME} is not running (stale pidfile)"
+    rm -f "$PIDFILE"
+    return 1
+}
+
+case "$1" in
+    start)
+        do_start
+        ;;
+    stop)
+        do_stop
+        ;;
+    restart|force-reload)
+        do_stop
+        do_start
+        ;;
+    status)
+        do_status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|force-reload|status}" >&2
+        exit 3
+        ;;
+esac
+
+exit 0

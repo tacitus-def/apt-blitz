@@ -1,7 +1,7 @@
 .\" Man page for apt-blitz
 .\" Generated from source; do not edit manually.
 .\"
-.TH APT-BLITZ 1 "2026-07-19" "0.6.1" "User Commands"
+.TH APT-BLITZ 1 "2026-07-19" "0.7.4" "User Commands"
 .SH NAME
 apt-blitz \- multithreaded proxy for APT-like package managers
 .SH SYNOPSIS
@@ -159,6 +159,20 @@ Default: \fB0\fR
 .br
 Env: \fBPROXY_PER_IP_BANDWIDTH\fR
 .TP
+.B \-\-coalesce\-follower\-timeout\-secs \fI\,SECS\/\fR
+Timeout in seconds for a follower waiting for an in\-flight download.
+.br
+Default: \fB50\fR
+.br
+Env: \fBPROXY_COALESCE_FOLLOWER_TIMEOUT_SECS\fR
+.TP
+.B \-\-coalesce\-max\-retries \fI\,N\/\fR
+Max retries when the leader drops the download before attaching a buffer.
+.br
+Default: \fB3\fR
+.br
+Env: \fBPROXY_COALESCE_MAX_RETRIES\fR
+.TP
 .B \-h, \-\-help
 Print help message and exit.
 .TP
@@ -209,6 +223,12 @@ Equivalent to \fB\-\-upstream\-bandwidth\fR.
 .TP
 .B PROXY_PER_IP_BANDWIDTH
 Equivalent to \fB\-\-per\-ip\-bandwidth\fR.
+.TP
+.B PROXY_COALESCE_FOLLOWER_TIMEOUT_SECS
+Equivalent to \fB\-\-coalesce\-follower\-timeout\-secs\fR.
+.TP
+.B PROXY_COALESCE_MAX_RETRIES
+Equivalent to \fB\-\-coalesce\-max\-retries\fR.
 .SH FILES
 .TP
 .I apt-blitz.yaml, apt-blitz.yml
@@ -242,6 +262,8 @@ max_total_connections: 0
 max_workers: 0
 upstream_bandwidth: 50M
 per_ip_bandwidth: 10M
+coalesce_follower_timeout_secs: 50
+coalesce_max_retries: 3
 .RE
 .fi
 .SH AUTHORS
