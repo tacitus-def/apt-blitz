@@ -1,3 +1,5 @@
+//! CLI, YAML config, and environment variable parsing.
+
 use anyhow::Context;
 use clap::Parser;
 use std::path::PathBuf;

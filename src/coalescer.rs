@@ -1,3 +1,5 @@
+//! In-flight request deduplication (leader/follower pattern).
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;

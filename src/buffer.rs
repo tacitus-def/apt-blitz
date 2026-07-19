@@ -1,3 +1,5 @@
+//! Disk-backed segment buffer for parallel downloads.
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

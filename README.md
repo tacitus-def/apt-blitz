@@ -245,10 +245,11 @@ docker run --rm -p 8080:8080 apt-blitz
 ## Limitations
 
 - HTTP forward proxy only; no transparent or reverse proxy mode.
+- CONNECT tunnel does not filter loopback, cloud metadata, or private network IPs.
 - FTPS (`ftps://`) is parsed but not yet supported — use plain `ftp://` instead.
 - Single catch-all route (`/{*url}`) — expects fully-qualified upstream URLs in the path.
 - No authentication or access control.
-- Minimum segment size is 64 K.
+- Minimum segment size is 64 K.
 
 ## License
 

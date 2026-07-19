@@ -1,3 +1,5 @@
+//! FTP protocol support: URL parsing, control connection, PASV download.
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,6 +19,18 @@ pub struct FtpUrl {
     pub host: String,
     pub port: u16,
     pub path: String,
+}
+
+fn normalize_ftp_path(path: &str) -> String {
+    let mut segments = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => continue,
+            ".." => { segments.pop(); }
+            seg => segments.push(seg),
+        }
+    }
+    format!("/{}", segments.join("/"))
 }
 
 pub fn parse_ftp_url(url: &str) -> anyhow::Result<FtpUrl> {
@@ -62,7 +76,7 @@ pub fn parse_ftp_url(url: &str) -> anyhow::Result<FtpUrl> {
         anyhow::bail!("empty host in FTP URL: {url}");
     }
 
-    Ok(FtpUrl { scheme, username, password, host, port, path: path.to_string() })
+    Ok(FtpUrl { scheme, username, password, host, port, path: normalize_ftp_path(&path) })
 }
 
 // ---- minimal FTP control connection ----
@@ -934,13 +948,42 @@ mod tests {
     #[test]
     fn test_parse_ftp_url_double_slash_in_path() {
         let u = parse_ftp_url("ftp://host//double//slashes").unwrap();
-        assert_eq!(u.path, "//double//slashes");
+        assert_eq!(u.path, "/double/slashes");
     }
 
     #[test]
-    #[ignore = "known issue: path traversal through /../ in FTP URL is not resolved by the parser"]
-    fn test_parse_ftp_url_dot_segments() {
+    fn test_parse_ftp_url_dot_segments_normalized() {
         let u = parse_ftp_url("ftp://host/path/../secret").unwrap();
-        assert_eq!(u.path, "/path/../secret");
+        assert_eq!(u.path, "/secret");
+    }
+
+    #[test]
+    fn test_normalize_ftp_path_dot_only() {
+        let u = parse_ftp_url("ftp://host/a/./b").unwrap();
+        assert_eq!(u.path, "/a/b");
+    }
+
+    #[test]
+    fn test_normalize_ftp_path_multiple_dots() {
+        let u = parse_ftp_url("ftp://host/a/b/../../c").unwrap();
+        assert_eq!(u.path, "/c");
+    }
+
+    #[test]
+    fn test_normalize_ftp_path_root_traversal() {
+        let u = parse_ftp_url("ftp://host/../secret").unwrap();
+        assert_eq!(u.path, "/secret");
+    }
+
+    #[test]
+    fn test_normalize_ftp_path_trailing_dotdot() {
+        let u = parse_ftp_url("ftp://host/a/b/..").unwrap();
+        assert_eq!(u.path, "/a");
+    }
+
+    #[test]
+    fn test_normalize_ftp_path_empty_segments() {
+        let u = parse_ftp_url("ftp://host/a///b").unwrap();
+        assert_eq!(u.path, "/a/b");
     }
 }

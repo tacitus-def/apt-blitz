@@ -1,3 +1,5 @@
+//! Token bucket rate limiter and per-IP/global concurrency limits.
+
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,3 +1,5 @@
+//! apt-blitz: multithreaded HTTP/FTP proxy for APT package managers.
+
 #![deny(unsafe_code)]
 
 #[cfg(not(unix))]

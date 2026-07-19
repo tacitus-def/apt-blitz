@@ -1,3 +1,5 @@
+//! SQLite-backed disk cache with LRU eviction.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
