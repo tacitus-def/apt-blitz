@@ -75,9 +75,17 @@ All options can be set via CLI flags or environment variables. A YAML config fil
 | `--max-total-connections` | `PROXY_MAX_TOTAL_CONNECTIONS` | `0` | Max total concurrent connections across all IPs |
 | `--max-workers` | `PROXY_MAX_WORKERS` | `0` | Max worker threads across all concurrent downloads |
 
+**Coalescing** (request deduplication tuning):
+
+| Flag | Env | Default | Description |
+|------|-----|---------|-------------|
+| `--coalesce-follower-timeout-secs` | `PROXY_COALESCE_FOLLOWER_TIMEOUT_SECS` | `50` | Timeout (seconds) for a follower waiting for the leader's in-flight download buffer |
+| `--coalesce-max-retries` | `PROXY_COALESCE_MAX_RETRIES` | `3` | Max retries when the leader drops the download before the follower can attach to the buffer |
+
 ```bash
 # All environment variables
 PROXY_PORT=3128 PROXY_CACHE_DIR=/tmp/cache PROXY_UPSTREAM_PROXY=socks5://10.0.0.1:1080 \
+  PROXY_COALESCE_FOLLOWER_TIMEOUT_SECS=50 PROXY_COALESCE_MAX_RETRIES=3 \
   ./target/release/apt-blitz
 ```
 
@@ -102,6 +110,8 @@ max_total_connections: 0
 max_workers: 0
 upstream_bandwidth: 50M
 per_ip_bandwidth: 10M
+coalesce_follower_timeout_secs: 50
+coalesce_max_retries: 3
 ```
 
 Auto-discovery locations (in order):
