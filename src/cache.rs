@@ -277,6 +277,49 @@ pub fn is_fresh(cached_at: i64, headers: &HeaderMap, max_cache_age: u64) -> bool
     max_cache_age > 0 && age < max_cache_age as i64
 }
 
+/// Remaining freshness lifetime of a cached entry in seconds (0 when already expired).
+///
+/// Uses the same priority as [`is_fresh`]: `Cache-Control: max-age` → `Expires` →
+/// configured `max_cache_age` TTL. Returns `None` when the entry cannot be served
+/// fresh at all (`Cache-Control: no-cache`/`no-store`) or no expiry source exists.
+pub fn time_until_expiry(cached_at: i64, headers: &HeaderMap, max_cache_age: u64) -> Option<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+
+    if cached_at <= 0 || now < cached_at {
+        return None;
+    }
+
+    if let Some(cc) = headers.get("cache-control").and_then(|v| v.to_str().ok()) {
+        if cc.split(',').any(|d| {
+            let d = d.trim();
+            d == "no-cache" || d == "no-store"
+        }) {
+            return None;
+        }
+        if let Some(max_age) = parse_max_age(cc) {
+            return Some((cached_at.saturating_add(max_age as i64) - now).max(0) as u64);
+        }
+    }
+
+    if let Some(expires) = headers.get("expires").and_then(|v| v.to_str().ok()) {
+        if let Ok(expires_at) = httpdate::parse_http_date(expires) {
+            let expires_secs = expires_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            return Some((expires_secs - now).max(0) as u64);
+        }
+    }
+
+    if max_cache_age > 0 {
+        return Some((cached_at.saturating_add(max_cache_age as i64) - now).max(0) as u64);
+    }
+    None
+}
+
 /// Extract `max-age=N` from a `Cache-Control` header value.
 fn parse_max_age(cache_control: &str) -> Option<u64> {
     for directive in cache_control.split(',') {
@@ -1042,6 +1085,68 @@ mod tests {
         assert_eq!(parse_max_age("max-age=+"), None);
         assert_eq!(parse_max_age("max-age = 60"), None); // space before '=' → not matched
         assert_eq!(parse_max_age("no-cache"), None);
+    }
+
+    #[test]
+    fn test_time_until_expiry_ttl_fallback() {
+        // max_cache_age = 3600, cached 10s ago → remaining ≈ 3590
+        let remaining = time_until_expiry(now_secs() - 10, &HeaderMap::new(), 3600).unwrap();
+        assert!((3588..=3590).contains(&remaining), "remaining was {remaining}");
+        // aged past the TTL → already expired → 0
+        let remaining = time_until_expiry(now_secs() - 7200, &HeaderMap::new(), 3600).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_time_until_expiry_max_age() {
+        let h = hdr_cache_control("public, max-age=60");
+        let remaining = time_until_expiry(now_secs() - 10, &h, 0).unwrap();
+        assert!((49..=50).contains(&remaining), "remaining was {remaining}");
+        // expired according to max-age
+        let remaining = time_until_expiry(now_secs() - 120, &h, 0).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_time_until_expiry_expires() {
+        let future = httpdate::fmt_http_date(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+        );
+        let past = httpdate::fmt_http_date(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+        );
+        let mut h = HeaderMap::new();
+        h.insert("expires", future.parse().unwrap());
+        let remaining = time_until_expiry(now_secs(), &h, 0).unwrap();
+        assert!((3598..=3600).contains(&remaining), "remaining was {remaining}");
+
+        h.insert("expires", past.parse().unwrap());
+        let remaining = time_until_expiry(now_secs(), &h, 86400).unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn test_time_until_expiry_no_cache_forces_none() {
+        let h = hdr_cache_control("no-cache");
+        assert_eq!(time_until_expiry(now_secs() - 1, &h, 86400), None);
+        let h = hdr_cache_control("no-store");
+        assert_eq!(time_until_expiry(now_secs() - 1, &h, 86400), None);
+        let h = hdr_cache_control("max-age=3600, no-store");
+        assert_eq!(time_until_expiry(now_secs() - 1, &h, 86400), None);
+    }
+
+    #[test]
+    fn test_time_until_expiry_no_source_none() {
+        // No max-age, no expires, max_cache_age=0 → no expiry source
+        assert_eq!(time_until_expiry(now_secs() - 1, &HeaderMap::new(), 0), None);
+    }
+
+    #[test]
+    fn test_time_until_expiry_invalid_cached_at() {
+        let headers = HeaderMap::new();
+        assert_eq!(time_until_expiry(0, &headers, 86400), None);
+        assert_eq!(time_until_expiry(-5, &headers, 86400), None);
+        assert_eq!(time_until_expiry(now_secs() + 1000, &headers, 86400), None);
     }
 
     #[tokio::test]

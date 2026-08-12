@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, info_span, Instrument};
 
 use crate::buffer::SegmentsBuffer;
-use crate::cache::{etag_equals, is_fresh, Cache};
+use crate::cache::{etag_equals, is_fresh, time_until_expiry, Cache};
 use crate::coalescer::{Coalescer, RegisterResult};
 use crate::config::{Config, ProxyType, UrlMap};
 use crate::downloader::download_multithreaded;
@@ -198,7 +198,8 @@ async fn resolve_with_coalescing(
 
         if let Some((cached_path, cached_headers, cached_at)) = cache.lookup_entry(url).await {
             if is_fresh(cached_at, &cached_headers, max_cache_age) {
-                info!(req_id, path = %cached_path.display(), "cache hit (fresh)");
+                let ttl_secs = time_until_expiry(cached_at, &cached_headers, max_cache_age).unwrap_or(0);
+                info!(req_id, path = %cached_path.display(), ttl_secs, "cache hit (fresh)");
                 return Ok(CoalesceOutcome::Cached { path: cached_path, headers: cached_headers });
             }
 
