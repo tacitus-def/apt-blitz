@@ -246,6 +246,16 @@ Equivalent to \fB\-\-coalesce\-follower\-timeout\-secs\fR.
 .TP
 .B PROXY_COALESCE_MAX_RETRIES
 Equivalent to \fB\-\-coalesce\-max\-retries\fR.
+.SH LOGGING
+When a request is served from a fresh cache hit, the log line
+.B cache hit (fresh)
+includes the
+.B ttl_secs
+field: the number of seconds remaining until the cached entry
+expires.  The expiry is computed with the same precedence as for
+freshness checks: upstream
+\fBCache\-Control: max\-age\fR, then \fBExpires\fR, then
+\fB\-\-max\-cache\-age\fR.
 .SH FILES
 .TP
 .I apt-blitz.yaml, apt-blitz.yml

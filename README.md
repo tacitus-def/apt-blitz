@@ -115,7 +115,10 @@ Auto-discovery locations (in order):
 
 Cached files are served without contacting upstream while they are
 fresh (upstream `Cache-Control: max-age` / `Expires` take precedence,
-falling back to `--max-cache-age`). Once the freshness window expires,
+falling back to `--max-cache-age`). When a request is served from a
+fresh cache hit, the log line `cache hit (fresh)` reports the
+`ttl_secs` field — the number of seconds until the cached entry
+expires. Once the freshness window expires,
 the proxy revalidates the file with a conditional `HEAD`
 (`If-None-Match` / `If-Modified-Since`):
 
