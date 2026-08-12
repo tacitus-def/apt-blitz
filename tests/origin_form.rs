@@ -59,6 +59,7 @@ async fn origin_form_single_file() {
         connections: 4,
         cache_dir: cache_dir.path().join("cache"),
         max_cache_size: 1024 * 1024 * 1024,
+        max_cache_age: 86400,
         url_maps: vec![],
         upstream_proxy: None,
         no_proxy: vec![],
@@ -157,6 +158,7 @@ async fn origin_form_with_url_map() {
         connections: 4,
         cache_dir: cache_dir.path().join("cache"),
         max_cache_size: 1024 * 1024 * 1024,
+        max_cache_age: 86400,
         // UrlMap: fake-host → реальный upstream
         url_maps: vec![apt_blitz::config::UrlMap::parse(&format!("mirror.example.com={}", upstream.uri())).unwrap()],
         upstream_proxy: None,

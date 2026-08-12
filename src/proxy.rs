@@ -19,10 +19,10 @@ use reqwest::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn, info_span, Instrument};
+use tracing::{debug, error, info, warn, info_span, Instrument};
 
 use crate::buffer::SegmentsBuffer;
-use crate::cache::Cache;
+use crate::cache::{etag_equals, is_fresh, Cache};
 use crate::coalescer::{Coalescer, RegisterResult};
 use crate::config::{Config, ProxyType, UrlMap};
 use crate::downloader::download_multithreaded;
@@ -34,6 +34,17 @@ enum CoalesceOutcome {
     Cached { path: std::path::PathBuf, headers: HeaderMap },
     FollowerBuffer(Arc<SegmentsBuffer>),
     Leader,
+}
+
+/// Result of a conditional HEAD revalidation against upstream.
+#[derive(Debug)]
+enum Revalidate {
+    /// Cached content is still valid; carries headers to store/forward.
+    Fresh(HeaderMap),
+    /// Content changed (or cannot be verified) — must redownload.
+    Stale,
+    /// Upstream could not be reached — serve stale cache as a fallback.
+    Unreachable(reqwest::Error),
 }
 use crate::ftp;
 use crate::rate_limit::{IpPermit, IpRateLimiter, TokenBucket, WorkerLimiter};
@@ -104,6 +115,7 @@ const FORWARD_HEADERS: &[&str] = &[
     "etag",
     "cache-control",
     "expires",
+    "location",
 ];
 
 fn copy_forward_headers(from: &HeaderMap, to: &mut HeaderMap) {
@@ -165,12 +177,15 @@ fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
 
 async fn resolve_with_coalescing(
     url: &str,
+    client: &Client,
     cache: &Cache,
     coalescer: &Coalescer,
     failure_tracker: &FailureTracker,
     req_id: u64,
     follower_timeout: Duration,
     max_retries: u32,
+    max_cache_age: u64,
+    user_agent: Option<&http::HeaderValue>,
 ) -> Result<CoalesceOutcome, ProxyError> {
     let mut retries = 0u32;
     loop {
@@ -181,9 +196,33 @@ async fn resolve_with_coalescing(
             )));
         }
 
-        if let Some((cached_path, cached_headers)) = cache.lookup(url).await {
-            info!(req_id, path = %cached_path.display(), "cache hit");
-            return Ok(CoalesceOutcome::Cached { path: cached_path, headers: cached_headers });
+        if let Some((cached_path, cached_headers, cached_at)) = cache.lookup_entry(url).await {
+            if is_fresh(cached_at, &cached_headers, max_cache_age) {
+                info!(req_id, path = %cached_path.display(), "cache hit (fresh)");
+                return Ok(CoalesceOutcome::Cached { path: cached_path, headers: cached_headers });
+            }
+
+            if url.starts_with("http://") || url.starts_with("https://") {
+                info!(req_id, "cache entry stale, revalidating against upstream");
+                match revalidate_with_conditional_head(client, url, &cached_headers, user_agent, req_id).await {
+                    Revalidate::Fresh(new_headers) => {
+                        info!(req_id, "upstream confirmed cache is still valid");
+                        if let Err(e) = cache.refresh(url, &new_headers).await {
+                            warn!(req_id, error = %e, "failed to refresh cached metadata");
+                        }
+                        return Ok(CoalesceOutcome::Cached { path: cached_path, headers: new_headers });
+                    }
+                    Revalidate::Stale => {
+                        info!(req_id, "upstream content changed, redownloading");
+                    }
+                    Revalidate::Unreachable(e) => {
+                        warn!(req_id, url = %url, error = %e, "revalidation failed, serving stale cache");
+                        return Ok(CoalesceOutcome::Cached { path: cached_path, headers: cached_headers });
+                    }
+                }
+            } else {
+                info!(req_id, "cache entry aged past window (no validators), redownloading");
+            }
         }
 
         match coalescer.register(url) {
@@ -218,6 +257,56 @@ async fn resolve_with_coalescing(
             }
         }
     }
+}
+
+/// Send a conditional HEAD to upstream and decide whether the cached copy is still valid.
+async fn revalidate_with_conditional_head(
+    client: &Client,
+    url: &str,
+    cached_headers: &HeaderMap,
+    user_agent: Option<&http::HeaderValue>,
+    req_id: u64,
+) -> Revalidate {
+    let mut builder = client.head(url);
+    if let Some(ua) = user_agent {
+        builder = builder.header("user-agent", ua);
+    }
+    if let Some(etag) = cached_headers.get("etag") {
+        builder = builder.header("if-none-match", etag);
+    }
+    if let Some(last_modified) = cached_headers.get("last-modified") {
+        builder = builder.header("if-modified-since", last_modified);
+    }
+
+    let resp = match builder.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            debug!(req_id, url = %url, error = %e, "conditional HEAD failed");
+            return Revalidate::Unreachable(e);
+        }
+    };
+
+    decide_revalidate(resp.status(), resp.headers(), cached_headers)
+}
+
+/// Pure decision logic for a revalidation response (unit-testable).
+fn decide_revalidate(status: StatusCode, resp_headers: &HeaderMap, cached_headers: &HeaderMap) -> Revalidate {
+    if status == StatusCode::NOT_MODIFIED {
+        // A 304 may carry fresh validators / cache-control → store them along with the
+        // previously cached representation headers.
+        let mut merged = cached_headers.clone();
+        for name in ["etag", "last-modified", "cache-control", "expires"] {
+            if let Some(val) = resp_headers.get(name) {
+                merged.insert(name, val.clone());
+            }
+        }
+        return Revalidate::Fresh(merged);
+    }
+    // 200 with the same ETag → server ignored conditionals but content is unchanged.
+    if status.is_success() && etag_equals(cached_headers, resp_headers) {
+        return Revalidate::Fresh(cached_headers.clone());
+    }
+    Revalidate::Stale
 }
 
 /// Translate a fake‑host URL (`http://fake-host/…` or `ftp://fake-host/…`) to its real upstream URL.
@@ -601,7 +690,7 @@ async fn handle_proxy_inner(
         return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
-    match resolve_with_coalescing(&url, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries).await? {
+    match resolve_with_coalescing(&url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.max_cache_age, user_agent.as_ref()).await? {
         CoalesceOutcome::Cached { path, headers } => {
             let resp = serve_file(&path, &headers).await?;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
@@ -630,8 +719,14 @@ async fn handle_proxy_inner(
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         state.coalescer.complete(&url);
-        head_resp.error_for_status().map_err(ProxyError::Upstream)?;
-        unreachable!()
+        let mut fwd = HeaderMap::new();
+        copy_forward_headers(head_resp.headers(), &mut fwd);
+        let mut builder = Response::builder().status(head_status);
+        for (name, val) in &fwd {
+            builder = builder.header(name, val);
+        }
+        let resp = builder.body(Body::empty()).unwrap();
+        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
     let headers = head_resp.headers().clone();
@@ -730,7 +825,7 @@ async fn handle_proxy_inner(
 async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Response, ProxyError> {
     info!(req_id, "ftp request");
 
-    match resolve_with_coalescing(url, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries).await? {
+    match resolve_with_coalescing(url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.max_cache_age, None).await? {
         CoalesceOutcome::Cached { path, headers } => {
             return serve_file(&path, &headers).await;
         }
@@ -1009,7 +1104,8 @@ mod tests {
         assert!(FORWARD_HEADERS.contains(&"etag"));
         assert!(FORWARD_HEADERS.contains(&"cache-control"));
         assert!(FORWARD_HEADERS.contains(&"expires"));
-        assert_eq!(FORWARD_HEADERS.len(), 8);
+        assert!(FORWARD_HEADERS.contains(&"location"));
+        assert_eq!(FORWARD_HEADERS.len(), 9);
     }
 
     #[test]
@@ -1018,6 +1114,101 @@ mod tests {
         for h in FORWARD_HEADERS {
             assert!(unique.insert(*h), "duplicate header: {}", h);
         }
+    }
+
+    #[test]
+    fn test_copy_forward_headers_includes_location() {
+        let mut from = HeaderMap::new();
+        from.insert("location", "https://mirror.example.com/file.deb".parse().unwrap());
+        let mut to = HeaderMap::new();
+        copy_forward_headers(&from, &mut to);
+        assert_eq!(
+            to.get("location").unwrap().to_str().unwrap(),
+            "https://mirror.example.com/file.deb"
+        );
+    }
+
+    // --- revalidation decision ---
+
+    #[test]
+    fn test_decide_revalidate_304_is_fresh() {
+        let mut cached = HeaderMap::new();
+        cached.insert("etag", "\"v1\"".parse().unwrap());
+        cached.insert("content-type", "application/octet-stream".parse().unwrap());
+        let mut resp = HeaderMap::new();
+        resp.insert("etag", "\"v1\"".parse().unwrap());
+        resp.insert("cache-control", "max-age=7200".parse().unwrap());
+
+        match decide_revalidate(StatusCode::NOT_MODIFIED, &resp, &cached) {
+            Revalidate::Fresh(headers) => {
+                assert_eq!(headers.get("etag").unwrap().to_str().unwrap(), "\"v1\"");
+                assert_eq!(
+                    headers.get("cache-control").unwrap().to_str().unwrap(),
+                    "max-age=7200"
+                );
+                assert_eq!(
+                    headers.get("content-type").unwrap().to_str().unwrap(),
+                    "application/octet-stream"
+                );
+            }
+            other => panic!("expected Fresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_revalidate_200_same_etag_is_fresh() {
+        let mut cached = HeaderMap::new();
+        cached.insert("etag", "\"abc\"".parse().unwrap());
+        let mut resp = HeaderMap::new();
+        resp.insert("etag", "\"abc\"".parse().unwrap());
+        assert!(matches!(
+            decide_revalidate(StatusCode::OK, &resp, &cached),
+            Revalidate::Fresh(_)
+        ));
+    }
+
+    #[test]
+    fn test_decide_revalidate_200_different_etag_is_stale() {
+        let mut cached = HeaderMap::new();
+        cached.insert("etag", "\"abc\"".parse().unwrap());
+        let mut resp = HeaderMap::new();
+        resp.insert("etag", "\"def\"".parse().unwrap());
+        assert!(matches!(
+            decide_revalidate(StatusCode::OK, &resp, &cached),
+            Revalidate::Stale
+        ));
+    }
+
+    #[test]
+    fn test_decide_revalidate_200_without_etag_is_stale() {
+        // No ETag on either side → cannot verify → must redownload
+        let cached = HeaderMap::new();
+        let resp = HeaderMap::new();
+        assert!(matches!(
+            decide_revalidate(StatusCode::OK, &resp, &cached),
+            Revalidate::Stale
+        ));
+        // Response without etag, cached has one → stale
+        let mut cached = HeaderMap::new();
+        cached.insert("etag", "\"abc\"".parse().unwrap());
+        assert!(matches!(
+            decide_revalidate(StatusCode::OK, &resp, &cached),
+            Revalidate::Stale
+        ));
+    }
+
+    #[test]
+    fn test_decide_revalidate_non_success_is_stale() {
+        let cached = HeaderMap::new();
+        let resp = HeaderMap::new();
+        assert!(matches!(
+            decide_revalidate(StatusCode::NOT_FOUND, &resp, &cached),
+            Revalidate::Stale
+        ));
+        assert!(matches!(
+            decide_revalidate(StatusCode::METHOD_NOT_ALLOWED, &resp, &cached),
+            Revalidate::Stale
+        ));
     }
 
     #[tokio::test]
@@ -2081,9 +2272,10 @@ mod tests {
         let buffer = make_test_buffer(1024);
         coalescer.attach_buffer(url, buffer.clone());
 
+        let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
-            url, &cache, &coalescer, &tracker, 1,
-            Duration::from_secs(5), 3,
+            url, &client, &cache, &coalescer, &tracker, 1,
+            Duration::from_secs(5), 3, 86400, None,
         ).await.unwrap();
 
         match result {
@@ -2102,9 +2294,10 @@ mod tests {
         coalescer.register(url);
         coalescer.fail(url);
 
+        let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
-            url, &cache, &coalescer, &tracker, 1,
-            Duration::from_millis(100), 3,
+            url, &client, &cache, &coalescer, &tracker, 1,
+            Duration::from_millis(100), 3, 86400, None,
         ).await.unwrap();
 
         assert!(matches!(result, CoalesceOutcome::Leader));
@@ -2119,9 +2312,10 @@ mod tests {
 
         coalescer.register(url);
 
+        let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
-            url, &cache, &coalescer, &tracker, 1,
-            Duration::from_millis(50), 0,
+            url, &client, &cache, &coalescer, &tracker, 1,
+            Duration::from_millis(50), 0, 86400, None,
         ).await;
 
         assert!(result.is_err());
@@ -2148,9 +2342,10 @@ mod tests {
             coalescer_clone.fail(&url_clone);
         });
 
+        let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
-            url, &cache, &coalescer, &tracker, 1,
-            Duration::from_millis(100), 1,
+            url, &client, &cache, &coalescer, &tracker, 1,
+            Duration::from_millis(100), 1, 86400, None,
         ).await;
 
         assert!(result.is_ok());
@@ -2167,9 +2362,10 @@ mod tests {
             tracker.record_failure(url);
         }
 
+        let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
-            url, &cache, &coalescer, &tracker, 1,
-            Duration::from_secs(5), 3,
+            url, &client, &cache, &coalescer, &tracker, 1,
+            Duration::from_secs(5), 3, 86400, None,
         ).await;
 
         assert!(result.is_err());

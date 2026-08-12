@@ -1,3 +1,21 @@
+apt-blitz (0.8.1-1) unstable; urgency=medium
+
+  * Forward upstream HTTP status code to the client instead of 502 when
+    upstream HEAD returns an error (404, 403, etc.).
+  * Forward Location header so clients can follow upstream redirects.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Wed, 12 Aug 2026 18:00:00 +0300
+
+apt-blitz (0.8.0-1) unstable; urgency=medium
+
+  * Cache freshness: revalidate cached files against upstream via
+    conditional HEAD (If-None-Match / If-Modified-Since).
+  * New --max-cache-age option (default 86400s) to serve fresh-by-age
+    entries without contacting upstream.
+  * Migrate cache DB schema: add cached_at column with backfill.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Wed, 12 Aug 2026 12:00:00 +0300
+
 apt-blitz (0.7.4-1) unstable; urgency=medium
 
   * Configurable coalesce follower timeout and max retries.

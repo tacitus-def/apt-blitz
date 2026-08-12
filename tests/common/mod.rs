@@ -169,6 +169,119 @@ impl MockUpstream {
             .await;
     }
 
+    pub async fn register_file_with_etag(&self, name: &str, size: u64, etag: &str) {
+        let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+        let data = Arc::new(data);
+        let etag = etag.to_string();
+
+        // HEAD supports conditional revalidation: matching If-None-Match → 304.
+        let d = Arc::clone(&data);
+        let etag_head = etag.clone();
+        Mock::given(method("HEAD"))
+            .and(path(name))
+            .respond_with(move |req: &Request| {
+                let matches = req
+                    .headers
+                    .get("if-none-match")
+                    .is_some_and(|v| v.to_str().unwrap_or("") == etag_head);
+                if matches {
+                    return ResponseTemplate::new(304).insert_header("etag", etag_head.clone());
+                }
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", d.len().to_string())
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("etag", etag_head.clone())
+                    .set_body_bytes(&[])
+            })
+            .mount(&self.server)
+            .await;
+
+        let d2 = Arc::clone(&data);
+        Mock::given(method("GET"))
+            .and(path(name))
+            .respond_with(move |req: &Request| {
+                if let Some(range) = req.headers.get("range") {
+                    let range_str = range.to_str().unwrap_or("");
+                    if let Some((start, end)) = parse_range(range_str, d2.len() as u64) {
+                        let len = (end - start + 1) as usize;
+                        let chunk = d2[start as usize..=end as usize].to_vec();
+                        return ResponseTemplate::new(206)
+                            .insert_header(
+                                "content-range",
+                                format!("bytes {start}-{end}/{}", d2.len()),
+                            )
+                            .insert_header("content-length", len.to_string())
+                            .insert_header("etag", etag.clone())
+                            .set_body_bytes(chunk);
+                    }
+                }
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", d2.len().to_string())
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("etag", etag.clone())
+                    .set_body_bytes(d2.as_ref().clone())
+            })
+            .mount(&self.server)
+            .await;
+    }
+
+    pub async fn register_file_with_last_modified(&self, name: &str, size: u64, last_modified: &str) {
+        let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+        let data = Arc::new(data);
+        let lm = last_modified.to_string();
+
+        // HEAD supports revalidation via If-Modified-Since.
+        let d = Arc::clone(&data);
+        let lm_head = lm.clone();
+        Mock::given(method("HEAD"))
+            .and(path(name))
+            .respond_with(move |req: &Request| {
+                let matches = req
+                    .headers
+                    .get("if-modified-since")
+                    .is_some_and(|v| v.to_str().unwrap_or("") == lm_head);
+                if matches {
+                    return ResponseTemplate::new(304)
+                        .insert_header("last-modified", lm_head.clone());
+                }
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", d.len().to_string())
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("last-modified", lm_head.clone())
+                    .set_body_bytes(&[])
+            })
+            .mount(&self.server)
+            .await;
+
+        let d2 = Arc::clone(&data);
+        Mock::given(method("GET"))
+            .and(path(name))
+            .respond_with(move |req: &Request| {
+                if let Some(range) = req.headers.get("range") {
+                    let range_str = range.to_str().unwrap_or("");
+                    if let Some((start, end)) = parse_range(range_str, d2.len() as u64) {
+                        let len = (end - start + 1) as usize;
+                        let chunk = d2[start as usize..=end as usize].to_vec();
+                        return ResponseTemplate::new(206)
+                            .insert_header(
+                                "content-range",
+                                format!("bytes {start}-{end}/{}", d2.len()),
+                            )
+                            .insert_header("content-length", len.to_string())
+                            .insert_header("last-modified", lm.clone())
+                            .set_body_bytes(chunk);
+                    }
+                }
+                ResponseTemplate::new(200)
+                    .insert_header("content-length", d2.len().to_string())
+                    .insert_header("accept-ranges", "bytes")
+                    .insert_header("last-modified", lm.clone())
+                    .set_body_bytes(d2.as_ref().clone())
+            })
+            .mount(&self.server)
+            .await;
+    }
+
     pub async fn request_count(&self, name: &str) -> usize {
         self.server
             .received_requests()
@@ -176,6 +289,16 @@ impl MockUpstream {
             .unwrap_or_default()
             .into_iter()
             .filter(|r| r.url.path() == name)
+            .count()
+    }
+
+    pub async fn request_count_by_method(&self, name: &str, method: &str) -> usize {
+        self.server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path() == name && r.method.as_str() == method)
             .count()
     }
 }
@@ -220,6 +343,7 @@ impl TestContext {
             connections: 4,
             cache_dir: cache_dir.path().join("cache"),
             max_cache_size,
+            max_cache_age: 86400,
             url_maps: vec![],
             upstream_proxy: None,
             no_proxy: vec![],

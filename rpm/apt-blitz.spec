@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.7.4
+Version:    0.8.1
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other

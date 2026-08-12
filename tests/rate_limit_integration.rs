@@ -14,6 +14,7 @@ fn base_config() -> Config {
         connections: 4,
         cache_dir: Default::default(),
         max_cache_size: 1024 * 1024 * 1024,
+        max_cache_age: 86400,
         url_maps: vec![],
         upstream_proxy: None,
         no_proxy: vec![],
