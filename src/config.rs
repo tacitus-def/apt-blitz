@@ -196,6 +196,7 @@ pub struct Config {
     pub connections: usize,
     pub cache_dir: PathBuf,
     pub max_cache_size: u64,
+    pub max_cache_age: u64,
     pub url_maps: Vec<UrlMap>,
     pub upstream_proxy: Option<UpstreamProxy>,
     pub no_proxy: Vec<String>,
@@ -217,6 +218,7 @@ struct YamlConfig {
     cache_dir: Option<PathBuf>,
     #[serde(default, with = "serde_bytes_option")]
     max_cache_size: Option<u64>,
+    max_cache_age: Option<u64>,
     url_map: Option<Vec<String>>,
     upstream_proxy: Option<String>,
     no_proxy: Option<Vec<String>>,
@@ -252,6 +254,10 @@ struct Cli {
     #[arg(long, default_value = "1073741824", env = "PROXY_MAX_CACHE_SIZE",
           value_parser = parse_bytes_value)]
     max_cache_size: u64,
+
+    /// Seconds a cached file is served without revalidation; 0 = always revalidate
+    #[arg(long, default_value_t = 86400, env = "PROXY_MAX_CACHE_AGE")]
+    max_cache_age: u64,
 
     /// Explicit config file path. When unset, auto‑discovery is used.
     #[arg(long, env = "PROXY_CONFIG_FILE", hide = true)]
@@ -347,6 +353,7 @@ impl Config {
             connections: cli.connections,
             cache_dir: cli.cache_dir,
             max_cache_size: cli.max_cache_size,
+            max_cache_age: cli.max_cache_age,
             url_maps,
             upstream_proxy,
             no_proxy: cli.no_proxy,
@@ -418,6 +425,7 @@ impl YamlConfig {
         set!("CONNECTIONS", self.connections);
         set!("CACHE_DIR", self.cache_dir.as_ref().map(|p| p.to_string_lossy().to_string()));
         set!("MAX_CACHE_SIZE", self.max_cache_size);
+        set!("MAX_CACHE_AGE", self.max_cache_age);
 
         if let Some(maps) = &self.url_map {
             if !maps.is_empty() {
@@ -451,12 +459,13 @@ impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {}, max_connections_per_ip: {}, max_total_connections: {}, max_workers: {}, upstream_bandwidth: {}, per_ip_bandwidth: {}, coalesce_follower_timeout_secs: {}, coalesce_max_retries: {} }}",
+            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, max_cache_age: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {}, max_connections_per_ip: {}, max_total_connections: {}, max_workers: {}, upstream_bandwidth: {}, per_ip_bandwidth: {}, coalesce_follower_timeout_secs: {}, coalesce_max_retries: {} }}",
             self.port,
             self.bind,
             self.connections,
             self.cache_dir.display(),
             self.max_cache_size,
+            self.max_cache_age,
             self.url_maps.len(),
             self.upstream_proxy.as_ref().map(|u| format!("{:?}://{}:{}", u.proxy_type, u.host, u.port)).unwrap_or_default(),
             self.no_proxy.join(","),
@@ -537,6 +546,21 @@ mod tests {
         assert!(cli.url_map.is_empty());
         assert_eq!(cli.coalesce_follower_timeout_secs, 50);
         assert_eq!(cli.coalesce_max_retries, 3);
+        assert_eq!(cli.max_cache_age, 86400);
+    }
+
+    #[test]
+    fn test_cli_max_cache_age_override() {
+        let cli = Cli::try_parse_from(&["apt-blitz", "--max-cache-age", "0"]).unwrap();
+        assert_eq!(cli.max_cache_age, 0);
+        let cli = Cli::try_parse_from(&["apt-blitz", "--max-cache-age", "3600"]).unwrap();
+        assert_eq!(cli.max_cache_age, 3600);
+    }
+
+    #[test]
+    fn test_cli_max_cache_age_negative_rejected() {
+        let r = Cli::try_parse_from(&["apt-blitz", "--max-cache-age", "-1"]);
+        assert!(r.is_err());
     }
 
     #[test]
@@ -595,6 +619,7 @@ mod tests {
 port: 3128
 bind: "127.0.0.1"
 connections: 2
+max_cache_age: 3600
 url_map:
   - fake-debian=https://deb.debian.org
 upstream_proxy: "http://10.0.0.1:3128"
@@ -611,6 +636,7 @@ no_proxy:
         assert_eq!(std::env::var("PROXY_PORT").unwrap(), "3128");
         assert_eq!(std::env::var("PROXY_BIND").unwrap(), "127.0.0.1");
         assert_eq!(std::env::var("PROXY_CONNECTIONS").unwrap(), "2");
+        assert_eq!(std::env::var("PROXY_MAX_CACHE_AGE").unwrap(), "3600");
         assert!(std::env::var("PROXY_URL_MAP").unwrap().contains("fake-debian"));
         assert_eq!(std::env::var("PROXY_UPSTREAM_PROXY").unwrap(), "http://10.0.0.1:3128");
         assert_eq!(std::env::var("PROXY_NO_PROXY").unwrap(), ".local,10.0.0.0/8");
@@ -631,6 +657,7 @@ no_proxy:
         std::env::remove_var("PROXY_MAX_WORKERS");
         std::env::remove_var("PROXY_UPSTREAM_BANDWIDTH");
         std::env::remove_var("PROXY_PER_IP_BANDWIDTH");
+        std::env::remove_var("PROXY_MAX_CACHE_AGE");
     }
 
     #[test]
@@ -665,6 +692,7 @@ no_proxy:
             connections: 4,
             cache_dir: PathBuf::from("/tmp/cache"),
             max_cache_size: 1024,
+            max_cache_age: 86400,
             url_maps: vec![UrlMap::parse("a=http://a.com").unwrap()],
             upstream_proxy: None,
             no_proxy: vec![],
@@ -733,6 +761,7 @@ no_proxy:
             connections: 4,
             cache_dir: PathBuf::from("/var/cache/apt-blitz"),
             max_cache_size: 1_073_741_824,
+            max_cache_age: 86400,
             url_maps: vec![],
             upstream_proxy: None,
             no_proxy: vec![],
@@ -768,6 +797,7 @@ no_proxy:
             connections: None,
             cache_dir: None,
             max_cache_size: None,
+            max_cache_age: None,
             url_map: None,
             upstream_proxy: None,
             no_proxy: None,

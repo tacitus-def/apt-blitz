@@ -55,6 +55,7 @@ All options can be set via CLI flags or environment variables. A YAML config fil
 | `--connections` | `PROXY_CONNECTIONS` | `4` | Parallel connections per download |
 | `--cache-dir` | `PROXY_CACHE_DIR` | `/var/cache/apt-blitz` | Cache directory |
 | `--max-cache-size` | `PROXY_MAX_CACHE_SIZE` | `1073741824` (1 GiB) | Maximum cache size (supports `K`/`M`/`G`/`T`/`P` suffixes) |
+| `--max-cache-age` | `PROXY_MAX_CACHE_AGE` | `86400` | Seconds a cached file is served without revalidation; 0 = revalidate every request |
 | `--url-map` | `PROXY_URL_MAP` | — | Fake-host to real-base mapping (`fake-apt=https://real.example.com`), repeatable or comma-separated |
 | `--upstream-proxy` | `PROXY_UPSTREAM_PROXY` | — | Upstream proxy URL (`http://proxy:3128`, `socks5://host:1080`) |
 | `--no-proxy` | `PROXY_NO_PROXY` | — | Bypass upstream proxy for these hosts (supports `*`, suffix `.local`, CIDR) |
@@ -98,6 +99,7 @@ bind: "127.0.0.1"
 connections: 8
 cache_dir: "/var/cache/apt-blitz"
 max_cache_size: 4G
+max_cache_age: 86400
 url_map:
   - "deb=https://deb.debian.org"
   - "sec=https://security.debian.org"
@@ -118,6 +120,27 @@ Auto-discovery locations (in order):
 1. `./apt-blitz.yaml` / `./apt-blitz.yml`
 2. `~/.config/apt-blitz/config.yaml` / `config.yml`
 3. `/etc/apt-blitz/config.yaml` / `config.yml`
+
+### Cache freshness
+
+Cached files are served without contacting upstream while they are
+fresh (upstream `Cache-Control: max-age` / `Expires` take precedence,
+falling back to `--max-cache-age`). When a request is served from a
+fresh cache hit, the log line `cache hit (fresh)` reports the
+`ttl_secs` field — the number of seconds until the cached entry
+expires. Once the freshness window expires,
+the proxy revalidates the file with a conditional `HEAD`
+(`If-None-Match` / `If-Modified-Since`):
+
+- `304 Not Modified` → the cached copy is still valid and is served;
+- `200 OK` with a different `ETag` → the file changed and is downloaded
+  again, replacing the cached copy;
+- upstream unreachable during revalidation → the stale cached copy is
+  served with a warning.
+
+Files without validators (no `ETag` / `Last-Modified`, including FTP)
+are re-downloaded once their freshness window expires. Set
+`--max-cache-age 0` to revalidate on every request.
 
 ## Architecture
 

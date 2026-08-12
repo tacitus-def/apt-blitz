@@ -1,7 +1,7 @@
 .\" Man page for apt-blitz
 .\" Generated from source; do not edit manually.
 .\"
-.TH APT-BLITZ 1 "2026-07-19" "0.7.4" "User Commands"
+.TH APT-BLITZ 1 "2026-08-12" "0.8.2" "User Commands"
 .SH NAME
 apt-blitz \- multithreaded proxy for APT-like package managers
 .SH SYNOPSIS
@@ -72,6 +72,20 @@ Also accepts plain numbers.
 Default: \fB1073741824\fR (1 GiB)
 .br
 Env: \fBPROXY_MAX_CACHE_SIZE\fR
+.TP
+.B \-\-max\-cache\-age \fI\,SECS\/\fR
+Seconds a cached file is served without contacting the upstream
+server.  After the window expires the proxy revalidates the file
+with a conditional HEAD request (\fBIf\-None\-Match\fR /
+\fBIf\-Modified\-Since\fR).  A \fB304 Not Modified\fR keeps the
+cached copy; otherwise the file is downloaded again.  A value of
+\fB0\fR revalidates on every request.  Upstream
+\fBCache\-Control: max\-age\fR and \fBExpires\fR headers take
+precedence over this setting.
+.br
+Default: \fB86400\fR
+.br
+Env: \fBPROXY_MAX_CACHE_AGE\fR
 .TP
 .B \-\-config\-file \fI\,PATH\/\fR
 Explicit path to the YAML configuration file.
@@ -197,6 +211,9 @@ Equivalent to \fB\-\-cache\-dir\fR.
 .B PROXY_MAX_CACHE_SIZE
 Equivalent to \fB\-\-max\-cache\-size\fR.
 .TP
+.B PROXY_MAX_CACHE_AGE
+Equivalent to \fB\-\-max\-cache\-age\fR.
+.TP
 .B PROXY_CONFIG_FILE
 Equivalent to \fB\-\-config\-file\fR.
 .TP
@@ -229,6 +246,16 @@ Equivalent to \fB\-\-coalesce\-follower\-timeout\-secs\fR.
 .TP
 .B PROXY_COALESCE_MAX_RETRIES
 Equivalent to \fB\-\-coalesce\-max\-retries\fR.
+.SH LOGGING
+When a request is served from a fresh cache hit, the log line
+.B cache hit (fresh)
+includes the
+.B ttl_secs
+field: the number of seconds remaining until the cached entry
+expires.  The expiry is computed with the same precedence as for
+freshness checks: upstream
+\fBCache\-Control: max\-age\fR, then \fBExpires\fR, then
+\fB\-\-max\-cache\-age\fR.
 .SH FILES
 .TP
 .I apt-blitz.yaml, apt-blitz.yml
@@ -251,6 +278,7 @@ bind: "127.0.0.1"
 connections: 8
 cache_dir: "/var/cache/apt-blitz"
 max_cache_size: 5G
+max_cache_age: 86400
 url_map:
   \- fake-debian=https://deb.debian.org
 upstream_proxy: "http://10.0.0.1:3128"
