@@ -147,7 +147,14 @@ fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
                     .await
                     .is_ok_and(|r| r.is_ok())
                 {
-                    if let Err(e) = cache.store(&url, buffer.file_path(), &headers).await {
+                    if is_xz_url(&url)
+                        && !verify_xz_integrity(buffer.file_path(), req_id).await
+                    {
+                        error!(req_id, url = %url, "xz integrity check failed, not storing corrupt file in cache");
+                        failure_tracker.record_failure(&url);
+                        buffer.set_failed();
+                        let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                    } else if let Err(e) = cache.store(&url, buffer.file_path(), &headers).await {
                         error!(req_id, error = %e, "failed to store in cache");
                         let _ = tokio::fs::remove_file(buffer.file_path()).await;
                     }
@@ -173,6 +180,43 @@ fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
             }
         }
     });
+}
+
+/// True when the URL points at an xz-compressed file whose integrity must be
+/// verified before it is trusted into the cache.
+fn is_xz_url(url: &str) -> bool {
+    url.split('?').next().unwrap_or(url).ends_with(".xz")
+}
+
+/// Verify that a downloaded xz stream decompresses cleanly. Used to keep
+/// mixed-generation (potentially corrupt) index files out of the cache.
+async fn verify_xz_integrity(path: &std::path::Path, req_id: u64) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        match std::process::Command::new("xz").arg("--test").arg("--quiet").arg(&path).status() {
+            Ok(status) if status.success() => true,
+            Ok(status) => {
+                warn!(
+                    req_id,
+                    path = %path.display(),
+                    exit = status.code(),
+                    "xz integrity test rejected the downloaded file"
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    req_id,
+                    path = %path.display(),
+                    error = %e,
+                    "failed to run xz --test; treating download as unverifiable and rejecting it"
+                );
+                false
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 async fn resolve_with_coalescing(
@@ -731,6 +775,7 @@ async fn handle_proxy_inner(
     }
 
     let headers = head_resp.headers().clone();
+    let etag = headers.get("etag").cloned();
     let content_length = headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
@@ -787,6 +832,7 @@ async fn handle_proxy_inner(
     let dl_worker_limiter = state.worker_limiter.clone();
     let dl_upstream_bucket = state.upstream_bucket.clone();
     let dl_user_agent = user_agent;
+    let dl_etag = etag;
     let dl_req_id = req_id;
     let download_handle = tokio::spawn(async move {
         download_multithreaded(
@@ -797,6 +843,7 @@ async fn handle_proxy_inner(
             &dl_worker_limiter,
             &dl_upstream_bucket,
             dl_user_agent,
+            dl_etag,
             dl_req_id,
         )
         .await
@@ -1046,6 +1093,69 @@ async fn plain_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_xz_url_plain() {
+        assert!(is_xz_url("https://mirror.example/altlinux/pkglist.classic.xz"));
+        assert!(is_xz_url("http://h/pkglist.classic.xz"));
+        assert!(!is_xz_url("https://mirror.example/altlinux/pkglist.classic"));
+        assert!(!is_xz_url("https://mirror.example/altlinux/pkglist.classic.gz"));
+        assert!(!is_xz_url("https://mirror.example/rpm/x.rpm"));
+    }
+
+    #[test]
+    fn test_is_xz_url_with_query_stripped() {
+        assert!(is_xz_url("http://h/pkglist.classic.xz?ver=1"));
+        assert!(is_xz_url("https://h/dir/pkglist.classic.xz?x=y&z=w"));
+    }
+
+    // xz stream containing the payload "hello world".
+    const VALID_XZ_HEX: &str = "fd377a585a000004e6d6b4460200210116000000742fe5a301000a68656c6c6f20776f726c640000da5223efcd7e03530001230bc21bfd091fb6f37d010000000004595a";
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn test_verify_xz_integrity_accepts_valid_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pkglist.classic.xz");
+        std::fs::write(&path, hex_to_bytes(VALID_XZ_HEX)).unwrap();
+
+        assert!(
+            verify_xz_integrity(&path, 1).await,
+            "a valid xz stream must pass the integrity check"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_xz_integrity_rejects_corrupt_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pkglist.classic.xz");
+        // Valid header but truncated/garbled body — decompression must fail.
+        std::fs::write(&path, hex_to_bytes(VALID_XZ_HEX)).unwrap();
+        let mut data = hex_to_bytes(VALID_XZ_HEX);
+        let mid = data.len() / 2;
+        data[mid] ^= 0xFF;
+        std::fs::write(&path, data).unwrap();
+
+        assert!(
+            !verify_xz_integrity(&path, 1).await,
+            "a corrupt xz stream must be rejected so it never reaches the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_xz_integrity_rejects_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pkglist.classic.xz");
+        std::fs::write(&path, b"this is not an xz stream at all").unwrap();
+
+        assert!(
+            !verify_xz_integrity(&path, 1).await,
+            "garbage bytes must fail the xz integrity check"
+        );
+    }
 
     #[test]
     fn test_proxy_error_bad_request_response() {

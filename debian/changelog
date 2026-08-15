@@ -1,3 +1,14 @@
+apt-blitz (0.9.0-1) unstable; urgency=medium
+
+  * Reject 200-OK responses to Range requests on multi-segment downloads
+    instead of silently truncating head-of-file bytes at segment offsets.
+  * Pin upstream ETag via If-Match on every segment; abort download when
+    the upstream file changes mid-download (412) to avoid mixed-generation data.
+  * Verify xz stream integrity (xz --test) before storing .xz files in cache.
+  * Log etag and last-modified metadata on cache store.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Fri, 15 Aug 2026 12:00:00 +0300
+
 apt-blitz (0.8.2-1) unstable; urgency=medium
 
   * Log remaining time-to-expiry (ttl_secs) when a request is served from a

@@ -28,6 +28,13 @@ fn is_transient_error(e: &reqwest::Error) -> bool {
     e.is_connect() || e.is_body() || e.is_timeout() || e.is_decode() || e.is_request()
 }
 
+/// Weak entity tags (`W/"..."`) must not be sent in `If-Match` (RFC 7232 §3.1
+/// requires strong comparison). Sending one would make the server reply 412.
+fn is_strong_etag(etag: &http::HeaderValue) -> bool {
+    !etag.as_bytes().starts_with(b"W/")
+        && !etag.as_bytes().starts_with(b"w/")
+}
+
 fn next_segment_size(speed: f64) -> u64 {
     if speed <= 0.0 {
         return INITIAL_SEGMENT_SIZE;
@@ -42,8 +49,25 @@ pub enum DownloadError {
     Reqwest(reqwest::Error),
     HttpStatus(StatusCode),
     Io(std::io::Error),
+    /// Server answered a Range request with a full 200 body instead of 206;
+    /// splicing it at a non-zero segment offset would corrupt the file.
+    RangeUnsupported,
+    /// Upstream file changed mid-download (If-Match precondition failed);
+    /// assembling a mixed-generation file must be aborted.
+    EtagChanged,
     BufferFailed,
     Cancelled,
+}
+
+impl DownloadError {
+    /// Errors that indicate the whole download must be aborted immediately
+    /// instead of being retried per-segment.
+    fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            DownloadError::RangeUnsupported | DownloadError::EtagChanged
+        )
+    }
 }
 
 impl From<reqwest::Error> for DownloadError {
@@ -71,6 +95,7 @@ fn spawn_one_worker(
     active: &Arc<AtomicUsize>,
     join_set: &mut JoinSet<Result<(), DownloadError>>,
     user_agent: Option<&http::HeaderValue>,
+    etag: Option<&http::HeaderValue>,
     req_id: u64,
 ) {
     let client = client.clone();
@@ -82,6 +107,7 @@ fn spawn_one_worker(
     let tx = ready_tx.clone();
     let active = active.clone();
     let ua = user_agent.cloned();
+    let etag = etag.cloned();
     active.fetch_add(1, Ordering::SeqCst);
     join_set.spawn(async move {
         let _permit = limiter.acquire().await;
@@ -94,6 +120,7 @@ fn spawn_one_worker(
             &bucket,
             &tx,
             ua.as_ref(),
+            etag.as_ref(),
             req_id,
         )
         .await;
@@ -111,6 +138,7 @@ pub async fn download_multithreaded(
     worker_limiter: &WorkerLimiter,
     upstream_bucket: &TokenBucket,
     user_agent: Option<http::HeaderValue>,
+    etag: Option<http::HeaderValue>,
     req_id: u64,
 ) -> Result<(), DownloadError> {
     let cancel = CancellationToken::new();
@@ -121,6 +149,18 @@ pub async fn download_multithreaded(
 
     let initial = num_connections.min(INITIAL_WORKER_COUNT);
     let mut total_spawned: usize = 0;
+
+    if let Some(etag) = &etag {
+        if is_strong_etag(etag) {
+            info!(req_id, etag = %etag.to_str().unwrap_or("<invalid>"), "pinning upstream etag via If-Match");
+        } else {
+            warn!(
+                req_id,
+                etag = %etag.to_str().unwrap_or("<invalid>"),
+                "weak etag cannot be used with If-Match (RFC 7232); skipping generation pinning"
+            );
+        }
+    }
 
     for i in 0..initial {
         spawn_one_worker(
@@ -135,6 +175,7 @@ pub async fn download_multithreaded(
             &active,
             &mut join_set,
             user_agent.as_ref(),
+            etag.as_ref(),
             req_id,
         );
         total_spawned += 1;
@@ -158,6 +199,7 @@ pub async fn download_multithreaded(
                                 &active,
                                 &mut join_set,
                                 user_agent.as_ref(),
+                                etag.as_ref(),
                                 req_id,
                             );
                             total_spawned += 1;
@@ -170,6 +212,11 @@ pub async fn download_multithreaded(
                 match result {
                     Some(Ok(Ok(()))) => {}
                     Some(Ok(Err(DownloadError::Cancelled))) => {}
+                    Some(Ok(Err(e))) if e.is_fatal() => {
+                        error!(req_id, error = ?e, "fatal downloader worker failure, aborting download");
+                        cancel.cancel();
+                        return Err(e);
+                    }
                     Some(Ok(Err(e))) => {
                         error!(req_id, error = ?e, "downloader worker failed");
                     }
@@ -216,6 +263,7 @@ async fn download_worker(
     upstream_bucket: &TokenBucket,
     segment_ready_tx: &mpsc::UnboundedSender<()>,
     user_agent: Option<&http::HeaderValue>,
+    etag: Option<&http::HeaderValue>,
     req_id: u64,
 ) -> Result<(), DownloadError> {
     let mut preferred_size = INITIAL_SEGMENT_SIZE;
@@ -256,6 +304,11 @@ async fn download_worker(
                 if let Some(ua) = user_agent {
                     builder = builder.header("user-agent", ua);
                 }
+                if let Some(etag) = etag {
+                    if is_strong_etag(etag) {
+                        builder = builder.header("if-match", etag);
+                    }
+                }
                 match builder.send().await {
                     Ok(r) => r,
                     Err(e) => {
@@ -280,6 +333,15 @@ async fn download_worker(
             };
 
             let status = response.status();
+            if status == StatusCode::PRECONDITION_FAILED {
+                warn!(
+                    req_id,
+                    worker = worker_id,
+                    segment = id,
+                    "upstream file changed mid-download (If-Match 412); aborting to avoid mixed-generation data"
+                );
+                return Err(DownloadError::EtagChanged);
+            }
             if status != StatusCode::PARTIAL_CONTENT && status != StatusCode::OK {
                 error!(
                     req_id,
@@ -292,12 +354,22 @@ async fn download_worker(
             }
 
             if status == StatusCode::OK {
+                let single_segment_full_file = start == 0 && end == buffer.total_size();
+                if !single_segment_full_file {
+                    warn!(
+                        req_id,
+                        worker = worker_id,
+                        segment = id,
+                        "server ignores Range header (200 OK instead of 206); \
+                         refusing to write head-of-file bytes at a segment offset"
+                    );
+                    return Err(DownloadError::RangeUnsupported);
+                }
                 warn!(
                     req_id,
                     worker = worker_id,
                     segment = id,
-                    "server ignores Range header (200 OK instead of 206); \
-                     segment will be truncated to expected size"
+                    "server ignores Range header but the whole file fits a single segment; accepting"
                 );
             }
 
@@ -620,6 +692,85 @@ mod tests {
         tx
     }
 
+    #[test]
+    fn test_is_strong_etag_strong() {
+        assert!(is_strong_etag(&http::HeaderValue::from_static("\"abc123\"")));
+        assert!(is_strong_etag(&http::HeaderValue::from_static("\"123\"")));
+    }
+
+    #[test]
+    fn test_is_strong_etag_weak_rejected() {
+        assert!(!is_strong_etag(&http::HeaderValue::from_static("W/\"abc123\"")));
+        assert!(!is_strong_etag(&http::HeaderValue::from_static("w/\"abc123\"")));
+    }
+
+    #[tokio::test]
+    async fn test_etag_pin_skipped_for_weak_etag() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let data = vec![0x44u8; 512];
+
+        Mock::given(method("GET"))
+            .and(path("/weak.dat"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-511/512")
+                    .set_body_bytes(data.as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/weak.dat", server.uri());
+        let buffer = create_temp_buffer(512);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+        let weak_etag = http::HeaderValue::from_static("W/\"abc\"");
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, Some(&weak_etag), 0).await;
+        assert!(result.is_ok(), "weak etag must not be sent via If-Match, download should succeed normally");
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests.iter().all(|r| r.headers.get("if-match").is_none()),
+            "weak etag must not be pinned with If-Match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_200_ok_accepted_for_single_full_file_segment() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let full_data = vec![0x66u8; 2048];
+
+        Mock::given(method("GET"))
+            .and(path("/whole.dat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("accept-ranges", "bytes")
+                    .set_body_bytes(full_data.as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/whole.dat", server.uri());
+        let buffer = create_temp_buffer(full_data.len() as u64);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, None, 0).await;
+        assert!(result.is_ok());
+        assert!(buffer.all_completed());
+
+        let read = buffer.read_data(0, full_data.len() as u64).unwrap();
+        assert_eq!(&read[..], &full_data[..]);
+    }
+
     #[tokio::test]
     async fn test_download_worker_small_file() {
         use wiremock::matchers::{method, path};
@@ -645,7 +796,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, None, 0).await;
         assert!(result.is_ok());
 
         assert!(buffer.all_completed());
@@ -689,7 +840,7 @@ mod tests {
             cancel_clone.cancel();
         });
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, None, 0).await;
         assert!(matches!(result, Err(DownloadError::Cancelled)));
     }
 
@@ -776,7 +927,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, None, 0).await;
         assert!(result.is_err());
 
         // Verify that retry was attempted: server should have received more than 1 request
@@ -813,7 +964,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, None, 0).await;
         assert!(result.is_err());
 
         // Verify retry was attempted: server should have received more than 1 request
@@ -832,12 +983,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_200_instead_of_206_truncates_to_segment_size() {
+    async fn test_200_instead_of_206_rejected_to_avoid_corruption() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let full_data = vec![0x55u8; 4096];
+        // File larger than one segment: a 200 OK body is the whole file and can
+        // only be written at offset 0; splashing it at segment offsets > 0 would
+        // corrupt the assembled file.
+        let full_data = vec![0x55u8; 3 * 1024 * 1024];
 
         Mock::given(method("GET"))
             .and(path("/no-range.dat"))
@@ -851,15 +1005,79 @@ mod tests {
 
         let client = reqwest::Client::new();
         let url = format!("{}/no-range.dat", server.uri());
-        let buffer = create_temp_buffer(2048);
+        let buffer = create_temp_buffer(full_data.len() as u64);
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
-        assert!(result.is_ok());
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, None, 0).await;
+        assert!(
+            matches!(result, Err(DownloadError::RangeUnsupported)),
+            "writing the head of a 200-OK body at a segment offset would corrupt the file; \
+             the download must be rejected instead of silently truncated"
+        );
 
-        let read = buffer.read_data(0, 2048).unwrap();
-        assert_eq!(&read[..], &full_data[..2048]);
+        // The buffer must not report the segment as complete: no corrupt bytes stored.
+        assert!(!buffer.all_completed(), "no segment may be marked ready for a truncated 200 response");
+    }
+
+    #[tokio::test]
+    async fn test_etag_pin_sends_if_match_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let data = vec![0x33u8; 512];
+
+        Mock::given(method("GET"))
+            .and(path("/etag.dat"))
+            .and(header("if-match", "\"abc123\""))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 0-511/512")
+                    .set_body_bytes(data.as_slice()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/etag.dat", server.uri());
+        let buffer = create_temp_buffer(512);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+        let etag = http::HeaderValue::from_static("\"abc123\"");
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, Some(&etag), 0).await;
+        assert!(result.is_ok(), "server honoring If-Match should serve the segment normally");
+        assert!(buffer.all_completed());
+    }
+
+    #[tokio::test]
+    async fn test_etag_pin_412_aborts_download() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/changed.dat"))
+            .respond_with(ResponseTemplate::new(412))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/changed.dat", server.uri());
+        let buffer = create_temp_buffer(1024);
+        let cancel = CancellationToken::new();
+        let bucket = TokenBucket::unlimited();
+        let etag = http::HeaderValue::from_static("\"stale\"");
+
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, Some(&etag), 0).await;
+        assert!(
+            matches!(result, Err(DownloadError::EtagChanged)),
+            "412 Precondition Failed means the upstream file changed mid-download; \
+             assembling a mixed-generation file must abort"
+        );
+        assert!(!buffer.all_completed());
     }
 
     #[tokio::test]
@@ -892,7 +1110,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let bucket = TokenBucket::unlimited();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &dummy_ready_tx(), None, None, 0).await;
         assert!(result.is_ok(), "worker should not panic when Content-Length is absent");
 
         let read = buffer.read_data(0, 512).unwrap();
@@ -924,7 +1142,7 @@ mod tests {
         let bucket = TokenBucket::unlimited();
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
 
-        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &tx, None, 0).await;
+        let result = download_worker(&client, &url, buffer.clone(), cancel, 0, &bucket, &tx, None, None, 0).await;
         assert!(result.is_ok());
         assert!(buffer.all_completed());
 

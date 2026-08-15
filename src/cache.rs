@@ -183,6 +183,15 @@ impl Cache {
             inner: headers_to_map(headers),
         })?;
 
+        let etag = headers
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let last_modified = headers
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
         let conn = self.conn.clone();
         let url_owned = url.to_string();
         let file_name_owned = file_name.clone();
@@ -203,7 +212,13 @@ impl Cache {
 
             evict_inner(&conn, &dir, max_size);
 
-            info!(url = %url_owned, size = size, "cached");
+            info!(
+                url = %url_owned,
+                size = size,
+                etag = etag.as_deref().unwrap_or("-"),
+                last_modified = last_modified.as_deref().unwrap_or("-"),
+                "cached"
+            );
 
             anyhow::Ok(())
         })

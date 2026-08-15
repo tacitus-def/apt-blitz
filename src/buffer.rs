@@ -58,6 +58,10 @@ impl SegmentsBuffer {
         &self.file_path
     }
 
+    pub fn total_size(&self) -> u64 {
+        self.total_size
+    }
+
     pub fn set_meta(&self, status: StatusCode, headers: HeaderMap) {
         self.meta.send_replace(Some((status, headers)));
     }

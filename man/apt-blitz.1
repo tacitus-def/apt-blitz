@@ -1,7 +1,7 @@
 .\" Man page for apt-blitz
 .\" Generated from source; do not edit manually.
 .\"
-.TH APT-BLITZ 1 "2026-08-12" "0.8.2" "User Commands"
+.TH APT-BLITZ 1 "2026-08-15" "0.9.0" "User Commands"
 .SH NAME
 apt-blitz \- multithreaded proxy for APT-like package managers
 .SH SYNOPSIS
@@ -256,6 +256,28 @@ expires.  The expiry is computed with the same precedence as for
 freshness checks: upstream
 \fBCache\-Control: max\-age\fR, then \fBExpires\fR, then
 \fB\-\-max\-cache\-age\fR.
+.P
+When a file is stored into the cache, the log line
+.B cached
+includes the stored
+.B size
+plus the upstream
+.B etag
+and
+.B last\-modified
+metadata.
+.P
+Multithreaded downloads pin the upstream ETag on every ranged GET via
+\fBIf\-Match\fR (strong ETags only).  If the upstream file changes
+mid\-download, the server replies 412 and the download is aborted so a
+mixed\-generation file is never assembled or cached.  A server that
+answers a ranged request with \fB200 OK\fR instead of \fB206\fR causes
+the download to be rejected rather than silently truncating
+head\-of\-file bytes at segment offsets.
+.P
+Before an \fI\&.xz\fR stream is stored into the cache, its integrity is
+verified with \fBxz \-\-test\fR.  A corrupt stream is rejected and never
+reaches the cache.
 .SH FILES
 .TP
 .I apt-blitz.yaml, apt-blitz.yml

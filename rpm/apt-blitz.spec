@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.8.2
+Version:    0.9.0
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -65,7 +65,7 @@ exit 0
 %doc README.md
 
 %changelog
-* Wed Aug 12 2026 Petr Sleptsov <spetr@bk.ru> - 0.8.2-1
+* Fri Aug 15 2026 Petr Sleptsov <spetr@bk.ru> - 0.9.0-1
 - Log remaining cache time-to-expiry (ttl_secs) on fresh cache hits
 
 * Sat Jul 04 2026 Petr Sleptsov <spetr@bk.ru> - 0.1.2-1
