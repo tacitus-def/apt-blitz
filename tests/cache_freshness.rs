@@ -26,6 +26,7 @@ fn base_config(max_cache_age: u64) -> Config {
         per_ip_bandwidth: 0,
         coalesce_follower_timeout_secs: 50,
         coalesce_max_retries: 3,
+        coalesce_etag_max_retries: 8,
     }
 }
 

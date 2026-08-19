@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.9.0
+Version:    0.9.1
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -65,6 +65,13 @@ exit 0
 %doc README.md
 
 %changelog
+* Wed Aug 19 2026 Petr Sleptsov <spetr@bk.ru> - 0.9.1-1
+- Fix 500 errors during upstream mirror re-sync: an upstream generation
+  change mid-download (If-Match 412 / EtagChanged) no longer trips the
+  failure cooldown, and followers retry with the new etag generation via a
+  dedicated retry budget (coalesce_etag_max_retries). Cooldown and etag
+  retry exhaustion now return 503 instead of 500.
+
 * Fri Aug 15 2026 Petr Sleptsov <spetr@bk.ru> - 0.9.0-1
 - Log remaining cache time-to-expiry (ttl_secs) on fresh cache hits
 

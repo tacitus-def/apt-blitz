@@ -1,3 +1,13 @@
+apt-blitz (0.9.1-1) unstable; urgency=medium
+
+  * Fix 500 errors during upstream mirror re-sync: an upstream generation
+    change mid-download (If-Match 412 / EtagChanged) no longer trips the
+    failure cooldown, and followers retry with the new etag generation via a
+    dedicated retry budget (coalesce_etag_max_retries). Cooldown and etag
+    retry exhaustion now return 503 instead of 500.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Wed, 19 Aug 2026 12:00:00 +0300
+
 apt-blitz (0.9.0-1) unstable; urgency=medium
 
   * Reject 200-OK responses to Range requests on multi-segment downloads

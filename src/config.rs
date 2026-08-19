@@ -207,6 +207,11 @@ pub struct Config {
     pub per_ip_bandwidth: u64,
     pub coalesce_follower_timeout_secs: u64,
     pub coalesce_max_retries: u32,
+    /// Separate, larger retry budget for downloads that fail because the
+    /// upstream file changed mid-download (`If-Match` 412). Such failures are
+    /// transient mirror re-syncs, so they must retry with the new generation
+    /// instead of being treated as an upstream outage.
+    pub coalesce_etag_max_retries: u32,
 }
 
 /// Raw YAML representation — all fields optional (file provides defaults)
@@ -231,6 +236,7 @@ struct YamlConfig {
     per_ip_bandwidth: Option<u64>,
     coalesce_follower_timeout_secs: Option<u64>,
     coalesce_max_retries: Option<u32>,
+    coalesce_etag_max_retries: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +310,11 @@ struct Cli {
     /// Max retries when leader drops the download before attaching a buffer
     #[arg(long, default_value_t = 3, env = "PROXY_COALESCE_MAX_RETRIES")]
     coalesce_max_retries: u32,
+
+    /// Max retries when the upstream file changes mid-download (If-Match 412);
+    /// transient mirror re-syncs retry with the new generation
+    #[arg(long, default_value_t = 8, env = "PROXY_COALESCE_ETAG_MAX_RETRIES")]
+    coalesce_etag_max_retries: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +375,7 @@ impl Config {
             per_ip_bandwidth: cli.per_ip_bandwidth,
             coalesce_follower_timeout_secs: cli.coalesce_follower_timeout_secs,
             coalesce_max_retries: cli.coalesce_max_retries,
+            coalesce_etag_max_retries: cli.coalesce_etag_max_retries,
         })
     }
 
@@ -452,6 +464,7 @@ impl YamlConfig {
         set!("PER_IP_BANDWIDTH", self.per_ip_bandwidth);
         set!("COALESCE_FOLLOWER_TIMEOUT_SECS", self.coalesce_follower_timeout_secs);
         set!("COALESCE_MAX_RETRIES", self.coalesce_max_retries);
+        set!("COALESCE_ETAG_MAX_RETRIES", self.coalesce_etag_max_retries);
     }
 }
 
@@ -459,7 +472,7 @@ impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, max_cache_age: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {}, max_connections_per_ip: {}, max_total_connections: {}, max_workers: {}, upstream_bandwidth: {}, per_ip_bandwidth: {}, coalesce_follower_timeout_secs: {}, coalesce_max_retries: {} }}",
+            "Config {{ port: {}, bind: {}, connections: {}, cache_dir: {}, max_cache_size: {}, max_cache_age: {}, url_maps: {}, upstream_proxy: {}, no_proxy: {}, max_connections_per_ip: {}, max_total_connections: {}, max_workers: {}, upstream_bandwidth: {}, per_ip_bandwidth: {}, coalesce_follower_timeout_secs: {}, coalesce_max_retries: {}, coalesce_etag_max_retries: {} }}",
             self.port,
             self.bind,
             self.connections,
@@ -476,6 +489,7 @@ impl std::fmt::Display for Config {
             self.per_ip_bandwidth,
             self.coalesce_follower_timeout_secs,
             self.coalesce_max_retries,
+            self.coalesce_etag_max_retries,
         )
     }
 }
@@ -703,6 +717,7 @@ no_proxy:
             per_ip_bandwidth: 0,
             coalesce_follower_timeout_secs: 50,
             coalesce_max_retries: 3,
+            coalesce_etag_max_retries: 8,
         };
         let s = format!("{cfg}");
         assert!(s.contains("8080"));
@@ -772,6 +787,7 @@ no_proxy:
             per_ip_bandwidth: 0,
             coalesce_follower_timeout_secs: 50,
             coalesce_max_retries: 3,
+            coalesce_etag_max_retries: 8,
         };
         let output = cfg.to_string();
         assert!(output.contains("port: 8080"));
@@ -808,6 +824,7 @@ no_proxy:
             per_ip_bandwidth: None,
             coalesce_follower_timeout_secs: None,
             coalesce_max_retries: None,
+            coalesce_etag_max_retries: None,
         };
         yaml.apply_env();
 

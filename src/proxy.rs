@@ -25,7 +25,7 @@ use crate::buffer::SegmentsBuffer;
 use crate::cache::{etag_equals, is_fresh, time_until_expiry, Cache};
 use crate::coalescer::{Coalescer, RegisterResult};
 use crate::config::{Config, ProxyType, UrlMap};
-use crate::downloader::download_multithreaded;
+use crate::downloader::{download_multithreaded, DownloadError};
 
 static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -136,6 +136,7 @@ fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
     coalescer: Arc<Coalescer>,
     failure_tracker: Arc<FailureTracker>,
     req_id: u64,
+    etag_changed_for: impl Fn(&E) -> bool + Send + 'static,
 ) {
     tokio::spawn(async move {
         match download_handle.await {
@@ -154,29 +155,40 @@ fn spawn_cache_persistence<E: std::fmt::Debug + Send + 'static>(
                         failure_tracker.record_failure(&url);
                         buffer.set_failed();
                         let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                        coalescer.fail(&url, false);
                     } else if let Err(e) = cache.store(&url, buffer.file_path(), &headers).await {
                         error!(req_id, error = %e, "failed to store in cache");
                         let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                        coalescer.fail(&url, false);
+                    } else {
+                        coalescer.complete(&url);
                     }
                 } else {
                     error!(req_id, "sync failed before cache store");
                     let _ = tokio::fs::remove_file(buffer.file_path()).await;
+                    coalescer.fail(&url, false);
                 }
-                coalescer.complete(&url);
             }
             Ok(Err(e)) => {
-                error!(req_id, url = %url, error = ?e, "download failed, cleaning up");
-                failure_tracker.record_failure(&url);
+                // An upstream generation change mid-download is a transient
+                // condition (mirror re-sync), not an upstream outage: it must
+                // not trip the failure cooldown, and followers should retry
+                // with the new etag generation.
+                let etag_changed = (etag_changed_for)(&e);
+                error!(req_id, url = %url, error = ?e, etag_changed, "download failed, cleaning up");
+                if !etag_changed {
+                    failure_tracker.record_failure(&url);
+                }
                 buffer.set_failed();
                 let _ = tokio::fs::remove_file(buffer.file_path()).await;
-                coalescer.fail(&url);
+                coalescer.fail(&url, etag_changed);
             }
             Err(e) => {
                 error!(req_id, url = %url, error = ?e, "download task panicked, cleaning up temp");
                 failure_tracker.record_failure(&url);
                 buffer.set_failed();
                 let _ = tokio::fs::remove_file(buffer.file_path()).await;
-                coalescer.fail(&url);
+                coalescer.fail(&url, false);
             }
         }
     });
@@ -228,6 +240,7 @@ async fn resolve_with_coalescing(
     req_id: u64,
     follower_timeout: Duration,
     max_retries: u32,
+    etag_max_retries: u32,
     max_cache_age: u64,
     user_agent: Option<&http::HeaderValue>,
 ) -> Result<CoalesceOutcome, ProxyError> {
@@ -235,8 +248,8 @@ async fn resolve_with_coalescing(
     loop {
         if failure_tracker.is_in_cooldown(url) {
             warn!(req_id, url = %url, "upstream in failure cooldown, rejecting");
-            return Err(ProxyError::Internal(format!(
-                "upstream unstable for {}, retry later", url
+            return Err(ProxyError::ServiceUnavailable(format!(
+                "upstream in failure cooldown for {}, retry later", url
             )));
         }
 
@@ -276,13 +289,21 @@ async fn resolve_with_coalescing(
                 match tokio::time::timeout(follower_timeout, rx).await {
                     Ok(Ok(buf)) => return Ok(CoalesceOutcome::FollowerBuffer(buf)),
                     Ok(Err(_)) => {
+                        let etag_changed = coalescer.etag_failed_for(url);
+                        let budget = if etag_changed { etag_max_retries } else { max_retries };
                         retries += 1;
-                        if retries > max_retries {
-                            return Err(ProxyError::Internal(format!(
-                                "leader failed {} times for {}, giving up", retries, url
-                            )));
+                        if retries > budget {
+                            return Err(if etag_changed {
+                                ProxyError::ServiceUnavailable(format!(
+                                    "upstream file kept changing for {}, retry later", url
+                                ))
+                            } else {
+                                ProxyError::Internal(format!(
+                                    "leader failed {} times for {}, giving up", retries, url
+                                ))
+                            });
                         }
-                        info!(req_id, retries, "leader dropped download, retrying");
+                        info!(req_id, retries, etag_changed, "leader dropped download, retrying");
                         continue;
                     }
                     Err(_) => {
@@ -426,6 +447,9 @@ pub enum ProxyError {
     Upstream(reqwest::Error),
     BadGateway(String),
     Internal(String),
+    /// Transient upstream condition the client should back off from and retry
+    /// later (e.g. upstream kept changing mid-download, or failure cooldown).
+    ServiceUnavailable(String),
     TooManyRequests,
 }
 
@@ -442,6 +466,7 @@ impl IntoResponse for ProxyError {
                 (StatusCode::BAD_GATEWAY, s)
             }
             ProxyError::Internal(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+            ProxyError::ServiceUnavailable(s) => (StatusCode::SERVICE_UNAVAILABLE, s),
             ProxyError::TooManyRequests => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate limit exceeded".into(),
@@ -461,6 +486,7 @@ impl std::fmt::Display for ProxyError {
             ProxyError::Upstream(e) => write!(f, "upstream error: {e}"),
             ProxyError::BadGateway(s) => write!(f, "bad gateway: {s}"),
             ProxyError::Internal(s) => write!(f, "{s}"),
+            ProxyError::ServiceUnavailable(s) => write!(f, "{s}"),
             ProxyError::TooManyRequests => write!(f, "too many requests"),
         }
     }
@@ -735,7 +761,7 @@ async fn handle_proxy_inner(
         return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
-    match resolve_with_coalescing(&url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.max_cache_age, user_agent.as_ref()).await? {
+    match resolve_with_coalescing(&url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.coalesce_etag_max_retries, state.config.max_cache_age, user_agent.as_ref()).await? {
         CoalesceOutcome::Cached { path, headers } => {
             let resp = serve_file(&path, &headers).await?;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
@@ -858,6 +884,7 @@ async fn handle_proxy_inner(
         state.coalescer.clone(),
         state.failure_tracker.clone(),
         req_id,
+        |e| matches!(e, DownloadError::EtagChanged),
     );
 
     let stream = make_buffer_stream(buffer, notify_rx);
@@ -873,7 +900,7 @@ async fn handle_proxy_inner(
 async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Response, ProxyError> {
     info!(req_id, "ftp request");
 
-    match resolve_with_coalescing(url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.max_cache_age, None).await? {
+    match resolve_with_coalescing(url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.coalesce_etag_max_retries, state.config.max_cache_age, None).await? {
         CoalesceOutcome::Cached { path, headers } => {
             return serve_file(&path, &headers).await;
         }
@@ -936,6 +963,7 @@ async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Re
         state.coalescer.clone(),
         state.failure_tracker.clone(),
         req_id,
+        |_| false,
     );
 
     let stream = make_buffer_stream(buffer, notify_rx);
@@ -2370,6 +2398,103 @@ mod tests {
         buf
     }
 
+    #[test]
+    fn test_coalescer_etag_failed_flag() {
+        let c = Coalescer::new();
+        let url = "http://example.com/etag-flag";
+        assert!(!c.etag_failed_for(url));
+        c.fail(url, true);
+        assert!(c.etag_failed_for(url));
+        c.fail(url, false);
+        assert!(!c.etag_failed_for(url));
+        c.fail(url, true);
+        c.complete(url);
+        assert!(!c.etag_failed_for(url));
+    }
+
+    #[tokio::test]
+    async fn test_etag_changed_skips_cooldown_but_flags_retry() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(
+            std::env::temp_dir().join("apt-blitz-test-etag-cooldown"),
+            1024 * 1024,
+        )
+        .unwrap();
+        let tracker = Arc::new(FailureTracker::new());
+        let url = "http://example.com/etag-changed.bin";
+        let buffer = make_test_buffer(1024);
+
+        let handle = tokio::spawn(async { Err(DownloadError::EtagChanged) });
+        spawn_cache_persistence(
+            handle,
+            buffer,
+            url.to_string(),
+            HeaderMap::new(),
+            cache,
+            coalescer.clone(),
+            tracker.clone(),
+            1,
+            |e| matches!(e, DownloadError::EtagChanged),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Two further real failures would trip the cooldown after 3 total. Since
+        // the etag change must NOT be recorded, the combined count stays below
+        // the threshold and the cooldown must NOT trigger.
+        tracker.record_failure(url);
+        tracker.record_failure(url);
+        assert!(
+            !tracker.is_in_cooldown(url),
+            "EtagChanged must not be counted toward cooldown"
+        );
+        assert!(
+            coalescer.etag_failed_for(url),
+            "etag change must be flagged so followers retry with the new generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_real_failure_records_and_is_not_etag() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(
+            std::env::temp_dir().join("apt-blitz-test-real-cooldown"),
+            1024 * 1024,
+        )
+        .unwrap();
+        let tracker = Arc::new(FailureTracker::new());
+        let url = "http://example.com/real-fail.bin";
+        let buffer = make_test_buffer(1024);
+
+        let handle = tokio::spawn(async { Err(DownloadError::Io(std::io::Error::other("boom"))) });
+        spawn_cache_persistence(
+            handle,
+            buffer,
+            url.to_string(),
+            HeaderMap::new(),
+            cache,
+            coalescer.clone(),
+            tracker.clone(),
+            1,
+            |_| false,
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // A real failure is recorded; two more push it over the cooldown
+        // threshold, unlike the etag path.
+        tracker.record_failure(url);
+        tracker.record_failure(url);
+        assert!(
+            tracker.is_in_cooldown(url),
+            "real failure must be recorded toward cooldown"
+        );
+        assert!(
+            !coalescer.etag_failed_for(url),
+            "real failure must not be flagged as an etag change"
+        );
+    }
+
     // --- resolve_with_coalescing tests ---
 
     #[tokio::test]
@@ -2386,7 +2511,7 @@ mod tests {
         let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
             url, &client, &cache, &coalescer, &tracker, 1,
-            Duration::from_secs(5), 3, 86400, None,
+            Duration::from_secs(5), 3, 3, 86400, None,
         ).await.unwrap();
 
         match result {
@@ -2403,12 +2528,12 @@ mod tests {
         let url = "http://example.com/leader-drop.bin";
 
         coalescer.register(url);
-        coalescer.fail(url);
+        coalescer.fail(url, false);
 
         let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
             url, &client, &cache, &coalescer, &tracker, 1,
-            Duration::from_millis(100), 3, 86400, None,
+            Duration::from_millis(100), 3, 3, 86400, None,
         ).await.unwrap();
 
         assert!(matches!(result, CoalesceOutcome::Leader));
@@ -2426,7 +2551,7 @@ mod tests {
         let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
             url, &client, &cache, &coalescer, &tracker, 1,
-            Duration::from_millis(50), 0, 86400, None,
+            Duration::from_millis(50), 0, 3, 86400, None,
         ).await;
 
         assert!(result.is_err());
@@ -2447,16 +2572,16 @@ mod tests {
         let url_clone = url.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            coalescer_clone.fail(&url_clone);
+            coalescer_clone.fail(&url_clone, false);
             tokio::time::sleep(Duration::from_millis(10)).await;
             coalescer_clone.register(&url_clone);
-            coalescer_clone.fail(&url_clone);
+            coalescer_clone.fail(&url_clone, false);
         });
 
         let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
             url, &client, &cache, &coalescer, &tracker, 1,
-            Duration::from_millis(100), 1, 86400, None,
+            Duration::from_millis(100), 1, 10, 86400, None,
         ).await;
 
         assert!(result.is_ok());
@@ -2476,7 +2601,7 @@ mod tests {
         let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
             url, &client, &cache, &coalescer, &tracker, 1,
-            Duration::from_secs(5), 3, 86400, None,
+            Duration::from_secs(5), 3, 3, 86400, None,
         ).await;
 
         assert!(result.is_err());

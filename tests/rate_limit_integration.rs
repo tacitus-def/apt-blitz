@@ -25,6 +25,7 @@ fn base_config() -> Config {
         per_ip_bandwidth: 0,
         coalesce_follower_timeout_secs: 50,
         coalesce_max_retries: 3,
+        coalesce_etag_max_retries: 8,
     }
 }
 

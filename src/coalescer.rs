@@ -13,6 +13,10 @@ enum Inflight {
 
 pub struct Coalescer {
     inflight: Mutex<HashMap<String, Inflight>>,
+    /// Tracks whether the last failure for a URL was caused by an upstream
+    /// generation change (`If-Match` 412). Survives the `inflight` entry so
+    /// followers that are about to retry can pick a dedicated retry budget.
+    etag_failed: Mutex<HashMap<String, bool>>,
 }
 
 const MAX_INFLIGHT: usize = 1024;
@@ -34,6 +38,7 @@ impl Coalescer {
     pub fn new() -> Self {
         Self {
             inflight: Mutex::new(HashMap::new()),
+            etag_failed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,10 +77,24 @@ impl Coalescer {
 
     pub fn complete(&self, url: &str) {
         self.inflight.lock().unwrap().remove(url);
+        self.etag_failed.lock().unwrap().remove(url);
     }
 
-    pub fn fail(&self, url: &str) {
+    /// Mark the in-flight download as failed. `etag_changed` records whether the
+    /// failure was due to the upstream file changing mid-download so that the
+    /// coalescing retry loop can apply a dedicated (larger) budget.
+    pub fn fail(&self, url: &str, etag_changed: bool) {
         self.inflight.lock().unwrap().remove(url);
+        self.etag_failed
+            .lock()
+            .unwrap()
+            .insert(url.to_string(), etag_changed);
+    }
+
+    /// True if the most recent `fail` for `url` was caused by an upstream
+    /// generation change (`If-Match` 412).
+    pub fn etag_failed_for(&self, url: &str) -> bool {
+        *self.etag_failed.lock().unwrap().get(url).unwrap_or(&false)
     }
 }
 
