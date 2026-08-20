@@ -1,6 +1,6 @@
 [package]
 name = "apt-blitz"
-version = "0.9.1"
+version = "0.10.1"
 edition = "2021"
 
 [dependencies]
@@ -39,3 +39,7 @@ hex = "0.4"
 
 # Re-use sha2 from main deps in tests
 sha2 = "0.10"
+
+[[bin]]
+name = "blitzctl"
+path = "src/bin/blitzctl/main.rs"

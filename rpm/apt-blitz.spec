@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.9.1
+Version:    0.10.1
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -65,6 +65,11 @@ exit 0
 %doc README.md
 
 %changelog
+* Thu Aug 20 2026 Petr Sleptsov <spetr@bk.ru> - 0.10.1-1
+- Add blitzctl control utility for cache management: list cached hosts,
+  browse the per-host resource filesystem tree, inspect file details, and
+  clear the cache fully or selectively by host/path.
+
 * Wed Aug 19 2026 Petr Sleptsov <spetr@bk.ru> - 0.9.1-1
 - Fix 500 errors during upstream mirror re-sync: an upstream generation
   change mid-download (If-Match 412 / EtagChanged) no longer trips the

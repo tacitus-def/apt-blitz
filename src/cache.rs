@@ -32,10 +32,36 @@ const SELECT_TOTAL_SIZE: &str = "SELECT COALESCE(SUM(size), 0) FROM cache_entrie
 
 const EVICT_OLDEST: &str = "SELECT url_hash, url, size, file_path FROM cache_entries ORDER BY last_access ASC LIMIT 1";
 
+const SELECT_ALL: &str = "SELECT url, file_path, size, last_access, cached_at FROM cache_entries";
+const SELECT_ENTRY_FULL: &str =
+    "SELECT file_path, size, last_access, headers, cached_at FROM cache_entries WHERE url_hash = ?1";
+const SELECT_ALL_FILE_PATHS: &str = "SELECT file_path FROM cache_entries";
+const DELETE_BY_HASH: &str = "DELETE FROM cache_entries WHERE url_hash = ?1";
+const DELETE_ALL: &str = "DELETE FROM cache_entries";
+
 #[derive(Serialize, Deserialize)]
 struct StoredHeaders {
     #[serde(flatten)]
     inner: HashMap<String, String>,
+}
+
+/// A cache entry as returned by listing operations.
+pub struct CachedFile {
+    pub url: String,
+    pub file_path: String,
+    pub size: u64,
+    pub last_access: i64,
+    pub cached_at: i64,
+}
+
+/// Full detail of a single cached entry, including stored response headers.
+pub struct CacheEntryDetail {
+    pub url: String,
+    pub file_path: String,
+    pub size: u64,
+    pub last_access: i64,
+    pub cached_at: i64,
+    pub headers: HashMap<String, String>,
 }
 
 fn headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
@@ -74,7 +100,9 @@ impl Cache {
 
         let db_path = dir.join("cache.db");
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
         conn.execute(CREATE_TABLE, [])?;
         migrate_schema(&conn)?;
 
@@ -228,9 +256,145 @@ impl Cache {
 
         Ok(final_path)
     }
+
+    /// Return every cached entry (URL, stored relative path, size, access times).
+    pub async fn list_all(&self) -> anyhow::Result<Vec<CachedFile>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(SELECT_ALL)?;
+            let rows = stmt.query_map([], |row| {
+                Ok(CachedFile {
+                    url: row.get(0)?,
+                    file_path: row.get(1)?,
+                    size: row.get::<_, i64>(2)?.max(0) as u64,
+                    last_access: row.get(3)?,
+                    cached_at: row.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            anyhow::Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    /// Return full detail for a single cached URL, or `None` if absent.
+    pub async fn entry_by_url(&self, url: &str) -> anyhow::Result<Option<CacheEntryDetail>> {
+        let hash = Self::hash_url(url);
+        let dir = self.dir.clone();
+        let conn = self.conn.clone();
+        let url_owned = url.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let row: Result<(String, i64, i64, String, i64), _> = conn.query_row(
+                SELECT_ENTRY_FULL,
+                [&hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            );
+            match row {
+                Ok((file_path, size, last_access, headers_json, cached_at)) => {
+                    let full = dir.join(&file_path);
+                    if !full.exists() {
+                        return anyhow::Ok(None);
+                    }
+                    let headers = serde_json::from_str::<StoredHeaders>(&headers_json)
+                        .map(|s| s.inner)
+                        .unwrap_or_default();
+                    anyhow::Ok(Some(CacheEntryDetail {
+                        url: url_owned,
+                        file_path,
+                        size: size.max(0) as u64,
+                        last_access,
+                        cached_at,
+                        headers,
+                    }))
+                }
+                Err(_) => anyhow::Ok(None),
+            }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    /// Delete the cache entries matching the given URLs (DB row + on-disk file each).
+    ///
+    /// File removal is guarded by [`std::path::Path::starts_with`] on the cache
+    /// directory to prevent traversal of attacker-controlled `file_path` values.
+    pub async fn delete_by_urls(&self, urls: &[String]) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let dir = self.dir.clone();
+        let urls: Vec<String> = urls.iter().map(|s| s.to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut removed = 0usize;
+            for url in &urls {
+                let hash = Cache::hash_url(url);
+                let file_path: Option<String> = conn
+                    .query_row(
+                        "SELECT file_path FROM cache_entries WHERE url_hash = ?1",
+                        [&hash],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(fp) = file_path {
+                    let full = dir.join(&fp);
+                    if full.starts_with(&dir) {
+                        let _ = std::fs::remove_file(&full);
+                    }
+                    conn.execute(DELETE_BY_HASH, [&hash])?;
+                    removed += 1;
+                }
+            }
+            anyhow::Ok(removed)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    /// Remove every cached entry and its on-disk file, plus stale `tmp/*.download`.
+    ///
+    /// File removal is guarded by [`std::path::Path::starts_with`] on the cache
+    /// directory. The SQLite database file itself is kept.
+    pub async fn clear_all(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let files: Vec<String> = {
+                let mut stmt = conn.prepare(SELECT_ALL_FILE_PATHS)?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let count = files.len();
+            for fp in &files {
+                let full = dir.join(fp);
+                if full.starts_with(&dir) {
+                    let _ = std::fs::remove_file(&full);
+                }
+            }
+            conn.execute(DELETE_ALL, [])?;
+
+            let tmp = dir.join("tmp");
+            if let Ok(entries) = std::fs::read_dir(&tmp) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "download") {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+            }
+            anyhow::Ok(count)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
 }
 
-fn migrate_schema(conn: &Connection) -> anyhow::Result<()> {
+    fn migrate_schema(conn: &Connection) -> anyhow::Result<()> {
     let mut has_cached_at = false;
     let mut stmt = conn.prepare("PRAGMA table_info(cache_entries)")?;
     let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -333,6 +497,16 @@ pub fn time_until_expiry(cached_at: i64, headers: &HeaderMap, max_cache_age: u64
         return Some((cached_at.saturating_add(max_cache_age as i64) - now).max(0) as u64);
     }
     None
+}
+
+/// Like [`time_until_expiry`] but accepts a header `HashMap` as stored in the DB.
+pub fn time_until_expiry_map(
+    cached_at: i64,
+    headers: &HashMap<String, String>,
+    max_cache_age: u64,
+) -> Option<u64> {
+    let hm = map_to_headers(headers.clone());
+    time_until_expiry(cached_at, &hm, max_cache_age)
 }
 
 /// Extract `max-age=N` from a `Cache-Control` header value.
@@ -1220,6 +1394,67 @@ mod tests {
         let result = cache.refresh("http://example.com/not-cached.deb", &HeaderMap::new()).await;
         assert!(result.is_ok());
         assert!(cache.lookup("http://example.com/not-cached.deb").await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_list_all_and_delete() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-list-del");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 1_000_000).unwrap();
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let urls = [
+            "http://example.com/a.deb",
+            "http://example.com/b.deb",
+            "http://other.com/c.deb",
+        ];
+        for (i, u) in urls.iter().enumerate() {
+            let p = temp_dir.join(format!("entry-{}.download", i));
+            std::fs::write(&p, b"data").unwrap();
+            cache.store(u, &p, &HeaderMap::new()).await.unwrap();
+        }
+
+        let all = cache.list_all().await.unwrap();
+        assert_eq!(all.len(), 3, "BUG: list_all did not return all stored entries");
+
+        cache.delete_by_urls(&[urls[0].to_string()]).await.unwrap();
+        let all = cache.list_all().await.unwrap();
+        assert_eq!(all.len(), 2, "BUG: delete_by_urls left an entry behind");
+
+        cache.clear_all().await.unwrap();
+        let all = cache.list_all().await.unwrap();
+        assert!(
+            all.is_empty(),
+            "BUG: clear_all did not empty the cache index"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_clear_removes_physical_files() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-clear-files");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 1_000_000).unwrap();
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let p = temp_dir.join("x.download");
+        std::fs::write(&p, b"payload").unwrap();
+        let final_path = cache
+            .store("http://example.com/x.deb", &p, &HeaderMap::new())
+            .await
+            .unwrap();
+        assert!(final_path.exists(), "stored file must exist before clear");
+
+        cache.clear_all().await.unwrap();
+        assert!(
+            !final_path.exists(),
+            "BUG: clear_all removed the DB row but left the cached file on disk"
+        );
+        assert!(
+            dir.join("cache.db").exists(),
+            "clear_all must keep the database file"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

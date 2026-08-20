@@ -379,6 +379,29 @@ impl Config {
         })
     }
 
+    /// Resolve only the cache directory without parsing the full server CLI.
+    ///
+    /// Precedence: explicit `cache_dir` in a discovered YAML config →
+    /// `PROXY_CACHE_DIR` env var → compiled-in default. Used by `blitzctl`
+    /// so it can locate the cache without requiring server-only flags.
+    pub fn cache_dir_only() -> PathBuf {
+        if let Some(path) = Self::discover() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(yaml) = serde_yaml::from_str::<YamlConfig>(&content) {
+                    if let Some(dir) = yaml.cache_dir {
+                        return dir;
+                    }
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("PROXY_CACHE_DIR") {
+            if !v.is_empty() {
+                return PathBuf::from(v);
+            }
+        }
+        PathBuf::from("/var/cache/apt-blitz")
+    }
+
     /// Auto‑discover config file at standard locations.
     fn discover() -> Option<PathBuf> {
         let candidates = [
