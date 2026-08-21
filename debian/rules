@@ -10,7 +10,7 @@ override_dh_auto_test:
 	cargo test --frozen || echo "Tests skipped during package build"
 
 override_dh_strip_nondeterminism:
-	dh_strip_nondeterminism -Xtarget/release/apt-blitz
+	dh_strip_nondeterminism -Xtarget/release/apt-blitz -Xtarget/release/blitzctl
 
 override_dh_auto_clean:
 	cargo clean

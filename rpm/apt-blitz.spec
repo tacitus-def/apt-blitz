@@ -33,6 +33,7 @@ cargo build --release --offline
 
 %install
 install -D -m 0755 target/release/apt-blitz %{buildroot}%{_bindir}/apt-blitz
+install -D -m 0755 target/release/blitzctl %{buildroot}%{_bindir}/blitzctl
 install -D -m 0644 debian/apt-blitz.service %{buildroot}%{_unitdir}/apt-blitz.service
 install -D -m 0644 debian/apt-blitz.default %{buildroot}%{_sysconfdir}/default/apt-blitz
 install -D -m 0644 man/apt-blitz.1 %{buildroot}%{_mandir}/man1/apt-blitz.1
@@ -57,6 +58,7 @@ exit 0
 
 %files
 %{_bindir}/apt-blitz
+%{_bindir}/blitzctl
 %{_mandir}/man1/apt-blitz.1*
 %{_unitdir}/apt-blitz.service
 %config(noreplace) %{_sysconfdir}/default/apt-blitz
