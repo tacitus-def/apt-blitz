@@ -88,6 +88,28 @@ fn normalize_target(s: &str) -> String {
     }
 }
 
+/// Which host form the user provided as input.
+///
+/// In `Alias` perspective only the configured alias (`fake-host` + alias
+/// path) is shown; in `Real` perspective only the real upstream host/path is
+/// shown. Filtering still accepts either form so a query reaches the right
+/// entries regardless of perspective.
+#[derive(Clone, Copy, PartialEq)]
+enum Perspective {
+    Alias,
+    Real,
+}
+
+/// Choose the display perspective from the host the user typed: if it is a
+/// configured alias, show the alias; otherwise show the real host.
+fn perspective_for(host: &str, maps: &[UrlMap]) -> Perspective {
+    if maps.iter().any(|m| m.fake_host == host) {
+        Perspective::Alias
+    } else {
+        Perspective::Real
+    }
+}
+
 /// A cached URL resolved against the configured `url_maps`.
 ///
 /// `real_*` is the actual upstream host/path stored in the cache (post
@@ -118,9 +140,20 @@ impl Resolved {
         self.disp_host == host || self.real_host == host
     }
 
-    /// Whether this entry's path (alias or real) starts with `prefix`.
-    fn path_matches(&self, prefix: &str) -> bool {
-        self.disp_path.starts_with(prefix) || self.real_path.starts_with(prefix)
+    /// Host shown under the given perspective.
+    fn host(&self, p: Perspective) -> &str {
+        match p {
+            Perspective::Alias => &self.disp_host,
+            Perspective::Real => &self.real_host,
+        }
+    }
+
+    /// Path shown under the given perspective.
+    fn path(&self, p: Perspective) -> &str {
+        match p {
+            Perspective::Alias => &self.disp_path,
+            Perspective::Real => &self.real_path,
+        }
     }
 }
 
@@ -355,11 +388,12 @@ async fn cmd_tree(
         Some(path_filter.to_string())
     };
 
+    let p = perspective_for(host, maps);
     let filtered: Vec<(Resolved, u64)> = entries
         .iter()
         .map(|e| (Resolved::new(&e.url, maps), e.size))
         .filter(|(r, _)| {
-            r.host_matches(host) && prefix.as_ref().is_none_or(|pre| r.path_matches(pre))
+            r.host_matches(host) && prefix.as_ref().is_none_or(|pre| r.path(p).starts_with(pre))
         })
         .collect();
 
@@ -371,26 +405,15 @@ async fn cmd_tree(
         return Ok(());
     }
 
-    let display_host = &filtered[0].0.disp_host;
-    let real_hosts: BTreeSet<&str> = filtered
-        .iter()
-        .map(|(r, _)| r.real_host.as_str())
-        .collect();
-    let real_str = if real_hosts.len() == 1 && real_hosts.contains(display_host.as_str()) {
-        "-".to_string()
-    } else {
-        real_hosts.iter().cloned().collect::<Vec<_>>().join(", ")
-    };
-
-    let mut root = TreeNode::new(display_host.to_string(), true);
+    let display_host = filtered[0].0.host(p).to_string();
+    let mut root = TreeNode::new(display_host.clone(), true);
     for (r, size) in &filtered {
-        root.insert(&r.disp_path, *size);
+        root.insert(r.path(p), *size);
     }
 
     println!(
-        "{}  (real: {})  ({} files, {})",
+        "{}  ({} files, {})",
         display_host,
-        real_str,
         root.file_count,
         human_size(root.size)
     );
@@ -424,54 +447,48 @@ fn basename(path: &str) -> &str {
 
 /// Pure matching core for `find`.
 ///
-/// `entries` are pre-resolved against `url_maps`. Returns `(folders, files)`
-/// where each item is a `(alias_path, real_path)` pair. The match is against
-/// the file/folder name unless `query` contains a `/`, in which case it is
-/// against the full path. Both the alias path and the real path are tested so
-/// queries may use either form.
+/// `entries` are pre-resolved against `url_maps`. `p` selects which host/path
+/// form to display and match against (alias or real). Returns `(folders,
+/// files)` where each item is a single printable path (`host + path`,
+/// folders with a trailing `/`). The match is against the file/folder name
+/// unless `query` contains a `/`, in which case it is against the full path.
 fn find_matches(
     host: &str,
     query: &str,
     entries: &[Resolved],
-) -> anyhow::Result<(BTreeSet<(String, String)>, BTreeSet<(String, String)>)> {
+    p: Perspective,
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
     let re = glob_to_regex(query)?;
     let path_mode = query.contains('/');
 
-    let mut folders: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut files: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut folders: BTreeSet<String> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
 
     for r in entries {
         if !r.host_matches(host) {
             continue;
         }
-        let disp_candidate = if path_mode {
-            r.disp_path.clone()
+        let candidate = if path_mode {
+            r.path(p).to_string()
         } else {
-            basename(&r.disp_path).to_string()
+            basename(r.path(p)).to_string()
         };
-        let real_candidate = if path_mode {
-            r.real_path.clone()
-        } else {
-            basename(&r.real_path).to_string()
-        };
-        if re.is_match(&disp_candidate) || re.is_match(&real_candidate) {
-            files.insert((
-                format!("{}{}", r.disp_host, r.disp_path),
-                format!("{}{}", r.real_host, r.real_path),
-            ));
+        if re.is_match(&candidate) {
+            files.insert(format!("{}{}", r.host(p), r.path(p)));
         }
 
-        let comps: Vec<&str> = r.disp_path.split('/').filter(|s| !s.is_empty()).collect();
+        let comps: Vec<&str> = r
+            .path(p)
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
         let mut acc = String::new();
         for c in &comps[..comps.len().saturating_sub(1)] {
             acc.push('/');
             acc.push_str(c);
             let folder_candidate = if path_mode { acc.clone() } else { c.to_string() };
             if re.is_match(&folder_candidate) || re.is_match(&c) {
-                folders.insert((
-                    format!("{}{}/", r.disp_host, acc),
-                    format!("{}{}/", r.real_host, acc),
-                ));
+                folders.insert(format!("{}{}/", r.host(p), acc));
             }
         }
     }
@@ -479,7 +496,12 @@ fn find_matches(
     Ok((folders, files))
 }
 
-async fn cmd_find(dir: &PathBuf, maps: &[UrlMap], host: &str, query: &str) -> anyhow::Result<()> {
+async fn cmd_find(
+    dir: &PathBuf,
+    maps: &[UrlMap],
+    host: &str,
+    query: &str,
+) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!("cache is empty or not initialized at {}", dir.display());
         return Ok(());
@@ -487,12 +509,13 @@ async fn cmd_find(dir: &PathBuf, maps: &[UrlMap], host: &str, query: &str) -> an
     let cache = Cache::new(dir.clone(), u64::MAX)?;
     let entries = cache.list_all().await?;
 
+    let p = perspective_for(host, maps);
     let resolved: Vec<Resolved> = entries
         .iter()
         .map(|e| Resolved::new(&e.url, maps))
         .collect();
 
-    let (folders, files) = find_matches(host, query, &resolved)?;
+    let (folders, files) = find_matches(host, query, &resolved, p)?;
 
     if folders.is_empty() && files.is_empty() {
         println!("no matches for host '{}' query '{}'", host, query);
@@ -506,11 +529,11 @@ async fn cmd_find(dir: &PathBuf, maps: &[UrlMap], host: &str, query: &str) -> an
         folders.len(),
         files.len()
     );
-    for (alias, real) in &folders {
-        println!("  {}   (real: {})", alias, real);
+    for f in &folders {
+        println!("  {}", f);
     }
-    for (alias, real) in &files {
-        println!("  {}   (real: {})", alias, real);
+    for f in &files {
+        println!("  {}", f);
     }
     Ok(())
 }
@@ -535,15 +558,11 @@ async fn cmd_info(dir: &PathBuf, maps: &[UrlMap], url: &str) -> anyhow::Result<(
                 Some(s) if s > 0 => format!("{}s remaining", s),
                 _ => "expired / not cacheable".to_string(),
             };
-            println!("URL (real):   {}", d.url);
-            println!("Host (real):  {}", r.real_host);
-            println!("Path (real):  {}", r.real_path);
-            if r.disp_host != r.real_host {
-                println!("Mapping:      {}{}", r.disp_host, r.disp_path);
-                println!("Host (alias): {}", r.disp_host);
-            } else {
-                println!("Mapping:      -");
-            }
+            // `info` is queried by the real cached URL, so only the real
+            // host/path is shown (no alias).
+            println!("URL:         {}", d.url);
+            println!("Host:        {}", r.real_host);
+            println!("Path:        {}", r.real_path);
             println!("Size:        {} ({} bytes)", human_size(d.size), d.size);
             println!("Cached at:   {}", fmt_ts(d.cached_at));
             println!("Last access: {}", fmt_ts(d.last_access));
@@ -592,6 +611,7 @@ async fn cmd_clear(
         Some(t) => {
             let norm = normalize_target(&t);
             let tgt = parse_target(&norm);
+            let p = perspective_for(&tgt.host, maps);
             let entries = cache.list_all().await?;
             let matches = |e: &CachedFile| -> bool {
                 let r = Resolved::new(&e.url, maps);
@@ -599,7 +619,7 @@ async fn cmd_clear(
                     && tgt
                         .path_prefix
                         .as_ref()
-                        .is_none_or(|pre| r.path_matches(pre))
+                        .is_none_or(|pre| r.path(p).starts_with(pre))
             };
             let filtered: Vec<&CachedFile> = entries.iter().filter(|e| matches(e)).collect();
             if filtered.is_empty() {
@@ -723,27 +743,24 @@ mod tests {
             mk("other.host", "/pool/main/a.deb"),
         ];
         // Name-only: `main` matches the folder, not the files.
-        let (folders, files) = find_matches("deb.debian.org", "main", &entries).unwrap();
+        let (folders, files) =
+            find_matches("deb.debian.org", "main", &entries, Perspective::Real).unwrap();
         assert_eq!(
             folders,
-            BTreeSet::from([(
-                "deb.debian.org/pool/main/".to_string(),
-                "deb.debian.org/pool/main/".to_string()
-            )])
+            BTreeSet::from(["deb.debian.org/pool/main/".to_string()])
         );
         assert!(files.is_empty());
 
         // Wildcard name: `*.deb` matches all cached files, no folder.
-        let (folders, files) = find_matches("deb.debian.org", "*.deb", &entries).unwrap();
+        let (folders, files) =
+            find_matches("deb.debian.org", "*.deb", &entries, Perspective::Real).unwrap();
         assert!(folders.is_empty());
         assert_eq!(files.len(), 3);
-        assert!(files.contains(&(
-            "deb.debian.org/pool/unstable/x.deb".to_string(),
-            "deb.debian.org/pool/unstable/x.deb".to_string()
-        )));
+        assert!(files.contains("deb.debian.org/pool/unstable/x.deb"));
 
         // Host filter is honoured: a host with no entries yields nothing.
-        let (folders, files) = find_matches("example.com", "main", &entries).unwrap();
+        let (folders, files) =
+            find_matches("example.com", "main", &entries, Perspective::Real).unwrap();
         assert!(folders.is_empty());
         assert!(files.is_empty());
     }
@@ -757,30 +774,45 @@ mod tests {
             mk("deb.debian.org", "/dists/unstable/InRelease"),
         ];
         // Path pattern: matches both the folder path and file paths.
-        let (folders, files) = find_matches("deb.debian.org", "pool/main", &entries).unwrap();
+        let (folders, files) =
+            find_matches("deb.debian.org", "pool/main", &entries, Perspective::Real).unwrap();
         assert_eq!(
             folders,
-            BTreeSet::from([(
-                "deb.debian.org/pool/main/".to_string(),
-                "deb.debian.org/pool/main/".to_string()
-            )])
+            BTreeSet::from(["deb.debian.org/pool/main/".to_string()])
         );
         assert_eq!(files.len(), 2);
-        assert!(files.contains(&(
-            "deb.debian.org/pool/main/a.deb".to_string(),
-            "deb.debian.org/pool/main/a.deb".to_string()
-        )));
+        assert!(files.contains("deb.debian.org/pool/main/a.deb"));
 
         // Glob path pattern with a slash enables path matching.
-        let (folders, files) = find_matches("deb.debian.org", "pool/*", &entries).unwrap();
+        let (folders, files) =
+            find_matches("deb.debian.org", "pool/*", &entries, Perspective::Real).unwrap();
         assert_eq!(
             folders,
-            BTreeSet::from([(
-                "deb.debian.org/pool/main/".to_string(),
-                "deb.debian.org/pool/main/".to_string()
-            )])
+            BTreeSet::from(["deb.debian.org/pool/main/".to_string()])
         );
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_find_perspective() {
+        let maps = vec![UrlMap::parse("f=http://real.com/base").unwrap()];
+        let mk = |url: &str| Resolved::new(url, &maps);
+        let entries = vec![
+            mk("http://real.com/base/pool/a.deb"),
+            mk("http://real.com/base/pool/b.deb"),
+        ];
+
+        // Query by alias → alias-only output (no real host leaked).
+        let (_, files) = find_matches("f", "*.deb", &entries, Perspective::Alias).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.starts_with("f/")));
+        assert!(!files.iter().any(|f| f.contains("real.com")));
+
+        // Query by real host → real-only output (no alias leaked).
+        let (_, files) = find_matches("real.com", "*.deb", &entries, Perspective::Real).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.starts_with("real.com/")));
+        assert!(!files.iter().any(|f| f.starts_with("f/")));
     }
 
     #[test]
@@ -849,8 +881,8 @@ mod tests {
         assert!(r.host_matches("f"));
         assert!(r.host_matches("real.com"));
         assert!(!r.host_matches("other"));
-        assert!(r.path_matches("/pool"));
-        assert!(r.path_matches("/base/pool"));
+        assert!(r.path(Perspective::Alias).starts_with("/pool"));
+        assert!(r.path(Perspective::Real).starts_with("/base/pool"));
 
         // No mapping: alias equals real, matches by real host only.
         let r2 = Resolved::new("http://other.com/pool/a.deb", &[]);

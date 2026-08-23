@@ -1,3 +1,11 @@
+apt-blitz (0.11.2-1) unstable; urgency=medium
+
+  * blitzctl: display a single host form based on the input. If the host
+    argument is a configured alias, show the alias only; if it is a real host,
+    show the real host only. cache hosts still lists both alias and real.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Sun, 23 Aug 2026 12:30:00 +0300
+
 apt-blitz (0.11.1-1) unstable; urgency=medium
 
   * blitzctl cache commands now resolve real hosts back to configured

@@ -81,7 +81,7 @@ async fn blitzctl_cache_workflow() {
         ],
     );
     assert!(
-        out.contains("Host (real):  deb.debian.org"),
+        out.contains("Host:        deb.debian.org"),
         "info: {}",
         out
     );
