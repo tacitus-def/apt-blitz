@@ -1,3 +1,13 @@
+apt-blitz (0.11.0-1) unstable; urgency=medium
+
+  * blitzctl cache tree now hides individual files by default; use --files/-f
+    to also list them.
+  * Add blitzctl cache find: search files and folders within a host by partial
+    or full match with * and ? wildcards; path patterns containing '/' match
+    against the full path, otherwise the name is matched.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Fri, 21 Aug 2026 12:00:00 +0300
+
 apt-blitz (0.10.1-1) unstable; urgency=medium
 
   * Add blitzctl control utility for cache management: list cached hosts,

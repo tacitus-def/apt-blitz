@@ -1,6 +1,6 @@
 //! Cache management subcommands for `blitzctl`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use apt_blitz::cache::{time_until_expiry_map, Cache, CacheEntryDetail, CachedFile};
@@ -17,11 +17,22 @@ pub enum CacheCmd {
         /// Optional path prefix filter within the host
         #[arg(default_value = "")]
         path: String,
+        /// Also list individual cached files (directories only by default)
+        #[arg(long, short)]
+        files: bool,
     },
     /// Show details of a single cached file by its exact URL
     Info {
         /// Exact cached URL
         url: String,
+    },
+    /// Search files and folders within a host by partial/full match
+    Find {
+        /// Resource host, e.g. deb.debian.org
+        host: String,
+        /// Search query. Supports `*` and `?` wildcards. With a `/` it matches
+        /// against the full path; otherwise against the name (last component).
+        query: String,
     },
     /// Clear the cache (all, or by host/path selector)
     Clear {
@@ -36,8 +47,13 @@ pub enum CacheCmd {
 pub async fn run(dir: PathBuf, sub: CacheCmd) -> anyhow::Result<()> {
     match sub {
         CacheCmd::Hosts => cmd_hosts(&dir).await,
-        CacheCmd::Tree { host, path } => cmd_tree(&dir, &host, &path).await,
+        CacheCmd::Tree {
+            host,
+            path,
+            files,
+        } => cmd_tree(&dir, &host, &path, files).await,
         CacheCmd::Info { url } => cmd_info(&dir, &url).await,
+        CacheCmd::Find { host, query } => cmd_find(&dir, &host, &query).await,
         CacheCmd::Clear { target, yes } => cmd_clear(&dir, target, yes).await,
     }
 }
@@ -174,7 +190,7 @@ impl TreeNode {
     }
 }
 
-fn print_tree(node: &TreeNode, prefix: &str) {
+fn print_tree(node: &TreeNode, prefix: &str, show_files: bool) {
     let mut children: Vec<&TreeNode> = node.children.values().collect();
     children.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
@@ -195,8 +211,8 @@ fn print_tree(node: &TreeNode, prefix: &str) {
                 child.file_count
             );
             let child_prefix = format!("{}{}    ", prefix, if last { " " } else { "│" });
-            print_tree(child, &child_prefix);
-        } else {
+            print_tree(child, &child_prefix, show_files);
+        } else if show_files {
             println!(
                 "{}{}{}  ({})",
                 prefix,
@@ -245,7 +261,12 @@ async fn cmd_hosts(dir: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_tree(dir: &PathBuf, host: &str, path_filter: &str) -> anyhow::Result<()> {
+async fn cmd_tree(
+    dir: &PathBuf,
+    host: &str,
+    path_filter: &str,
+    show_files: bool,
+) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!("cache is empty or not initialized at {}", dir.display());
         return Ok(());
@@ -289,7 +310,111 @@ async fn cmd_tree(dir: &PathBuf, host: &str, path_filter: &str) -> anyhow::Resul
         root.file_count,
         human_size(root.size)
     );
-    print_tree(&root, "");
+    print_tree(&root, "", show_files);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Find
+// ---------------------------------------------------------------------------
+
+/// Convert a glob-like pattern (`*` = any run, `?` = any char) into a
+/// case-insensitive regex. The regex is intentionally unanchored so the
+/// pattern matches both fully and partially.
+fn glob_to_regex(pattern: &str) -> anyhow::Result<regex::Regex> {
+    let mut re = String::from("(?i)");
+    for c in pattern.chars() {
+        match c {
+            '*' => re.push_str(".*"),
+            '?' => re.push('.'),
+            _ => re.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    Ok(regex::Regex::new(&re)?)
+}
+
+/// Last path component of `path` (the file or folder name).
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Pure matching core for `find`.
+///
+/// `entries` is a list of `(host, path)`. Returns `(folders, files)` where
+/// each item is the full printable path (`host + path`, folders with a
+/// trailing `/`). The match is against the file/folder name unless `query`
+/// contains a `/`, in which case it is against the full path.
+fn find_matches(
+    host: &str,
+    query: &str,
+    entries: &[(String, String)],
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let re = glob_to_regex(query)?;
+    let path_mode = query.contains('/');
+
+    let mut folders: BTreeSet<String> = BTreeSet::new();
+    let mut files: BTreeSet<String> = BTreeSet::new();
+
+    for (h, p) in entries {
+        if h != host {
+            continue;
+        }
+        let file_candidate = if path_mode { p.clone() } else { basename(p).to_string() };
+        if re.is_match(&file_candidate) {
+            files.insert(format!("{}{}", host, p));
+        }
+
+        let comps: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let mut acc = String::new();
+        for c in &comps[..comps.len().saturating_sub(1)] {
+            acc.push('/');
+            acc.push_str(c);
+            let folder_candidate = if path_mode { acc.clone() } else { c.to_string() };
+            if re.is_match(&folder_candidate) {
+                folders.insert(format!("{}{}/", host, acc));
+            }
+        }
+    }
+
+    Ok((folders, files))
+}
+
+async fn cmd_find(dir: &PathBuf, host: &str, query: &str) -> anyhow::Result<()> {
+    if !dir.join("cache.db").exists() {
+        println!("cache is empty or not initialized at {}", dir.display());
+        return Ok(());
+    }
+    let cache = Cache::new(dir.clone(), u64::MAX)?;
+    let entries = cache.list_all().await?;
+
+    let parsed: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| {
+            let (h, p) = host_and_path(&e.url);
+            (h, p)
+        })
+        .collect();
+
+    let (folders, files) = find_matches(host, query, &parsed)?;
+
+    if folders.is_empty() && files.is_empty() {
+        println!("no matches for host '{}' query '{}'", host, query);
+        return Ok(());
+    }
+
+    println!(
+        "Matches in {} (query '{}'): {} folders, {} files",
+        host,
+        query,
+        folders.len(),
+        files.len()
+    );
+    for f in &folders {
+        println!("  {}", f);
+    }
+    for f in &files {
+        println!("  {}", f);
+    }
     Ok(())
 }
 
@@ -446,5 +571,81 @@ mod tests {
         assert_eq!(human_size(1024), "1.0 KiB");
         assert_eq!(human_size(1536), "1.5 KiB");
         assert_eq!(human_size(1048576), "1.0 MiB");
+    }
+
+    #[test]
+    fn test_print_tree_hides_files_by_default() {
+        // Files remain in the tree model regardless of printing; the default
+        // behaviour of `print_tree` (show_files == false) must omit file
+        // lines while keeping directory aggregation intact.
+        let mut root = TreeNode::new("host".to_string(), true);
+        root.insert("/pool/main/a.deb", 100);
+        root.insert("/pool/main/b.deb", 200);
+        assert_eq!(root.file_count, 2);
+        let pool = &root.children["pool"];
+        assert_eq!(pool.file_count, 2);
+        let main = &pool.children["main"];
+        assert!(main.children.contains_key("a.deb"));
+        assert!(main.children.contains_key("b.deb"));
+    }
+
+    #[test]
+    fn test_glob_to_regex_wildcards() {
+        let re = glob_to_regex("*.deb").unwrap();
+        assert!(re.is_match("a.deb"));
+        assert!(re.is_match("pool/main/a.deb"));
+        assert!(!re.is_match("a.rpm"));
+
+        let re = glob_to_regex("pool/??in").unwrap();
+        assert!(re.is_match("pool/main"));
+        assert!(!re.is_match("pool/again"));
+
+        // Case-insensitive.
+        let re = glob_to_regex("MAIN").unwrap();
+        assert!(re.is_match("Main"));
+    }
+
+    #[test]
+    fn test_find_name_mode() {
+        let entries = vec![
+            ("deb.debian.org".to_string(), "/pool/main/a.deb".to_string()),
+            ("deb.debian.org".to_string(), "/pool/main/b.deb".to_string()),
+            ("deb.debian.org".to_string(), "/pool/unstable/x.deb".to_string()),
+            ("other.host".to_string(), "/pool/main/a.deb".to_string()),
+        ];
+        // Name-only: `main` matches the folder, not the files.
+        let (folders, files) = find_matches("deb.debian.org", "main", &entries).unwrap();
+        assert_eq!(folders, BTreeSet::from(["deb.debian.org/pool/main/".to_string()]));
+        assert!(files.is_empty());
+
+        // Wildcard name: `*.deb` matches all cached files, no folder.
+        let (folders, files) = find_matches("deb.debian.org", "*.deb", &entries).unwrap();
+        assert!(folders.is_empty());
+        assert_eq!(files.len(), 3);
+        assert!(files.contains("deb.debian.org/pool/unstable/x.deb"));
+
+        // Host filter is honoured: a host with no entries yields nothing.
+        let (folders, files) = find_matches("example.com", "main", &entries).unwrap();
+        assert!(folders.is_empty());
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_find_path_mode() {
+        let entries = vec![
+            ("deb.debian.org".to_string(), "/pool/main/a.deb".to_string()),
+            ("deb.debian.org".to_string(), "/pool/main/b.deb".to_string()),
+            ("deb.debian.org".to_string(), "/dists/unstable/InRelease".to_string()),
+        ];
+        // Path pattern: matches both the folder path and file paths.
+        let (folders, files) = find_matches("deb.debian.org", "pool/main", &entries).unwrap();
+        assert_eq!(folders, BTreeSet::from(["deb.debian.org/pool/main/".to_string()]));
+        assert_eq!(files.len(), 2);
+        assert!(files.contains("deb.debian.org/pool/main/a.deb"));
+
+        // Glob path pattern with a slash enables path matching.
+        let (folders, files) = find_matches("deb.debian.org", "pool/*", &entries).unwrap();
+        assert_eq!(folders, BTreeSet::from(["deb.debian.org/pool/main/".to_string()]));
+        assert_eq!(files.len(), 2);
     }
 }

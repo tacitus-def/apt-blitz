@@ -75,6 +75,7 @@ pub async fn run_proxy(config: Config) -> anyhow::Result<()> {
 
     let temp_dir = config.cache_dir.join("tmp");
     tokio::fs::create_dir_all(&temp_dir).await?;
+    crate::cache::make_world_readable_dir(&temp_dir);
     let mut dir = tokio::fs::read_dir(&temp_dir).await?;
     while let Some(entry) = dir.next_entry().await? {
         let path = entry.path();

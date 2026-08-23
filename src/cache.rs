@@ -12,6 +12,31 @@ use tracing::{info, warn};
 
 use rusqlite::Connection;
 
+/// Make a directory world-readable and traversable (rwxr-xr-x).
+/// Files inside remain readable only if their own permissions allow it.
+#[cfg(unix)]
+pub(crate) fn make_world_readable_dir(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)) {
+        warn!(path = %path.display(), error = %e, "failed to set world-readable directory permissions");
+    }
+}
+
+/// Make a regular file world-readable (rw-r--r--).
+#[cfg(unix)]
+pub(crate) fn make_world_readable_file(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)) {
+        warn!(path = %path.display(), error = %e, "failed to set world-readable file permissions");
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn make_world_readable_dir(_path: &Path) {}
+
+#[cfg(not(unix))]
+pub(crate) fn make_world_readable_file(_path: &Path) {}
+
 const CREATE_TABLE: &str = "
 CREATE TABLE IF NOT EXISTS cache_entries (
     url_hash TEXT PRIMARY KEY,
@@ -97,9 +122,11 @@ impl Cache {
         if !dir.exists() {
             std::fs::create_dir_all(&dir)?;
         }
+        make_world_readable_dir(&dir);
 
         let db_path = dir.join("cache.db");
         let conn = Connection::open(&db_path)?;
+        make_world_readable_file(&db_path);
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
         )?;
@@ -201,9 +228,11 @@ impl Cache {
 
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).await?;
+            make_world_readable_dir(parent);
         }
 
         fs::rename(temp_path, &final_path).await?;
+        make_world_readable_file(&final_path);
 
         let size = fs::metadata(&final_path).await?.len() as i64;
 

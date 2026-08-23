@@ -413,6 +413,7 @@ impl AppState {
             .expect("failed to init cache");
         let temp_dir = config.cache_dir.join("tmp");
         std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
+        crate::cache::make_world_readable_dir(&temp_dir);
 
         Self {
             client,

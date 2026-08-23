@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.10.1
+Version:    0.11.0
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -67,6 +67,13 @@ exit 0
 %doc README.md
 
 %changelog
+* Fri Aug 21 2026 Petr Sleptsov <spetr@bk.ru> - 0.11.0-1
+- blitzctl cache tree now hides individual files by default; use --files/-f
+  to also list them.
+- Add blitzctl cache find: search files and folders within a host by partial
+  or full match with * and ? wildcards; path patterns containing '/' match
+  against the full path, otherwise the name is matched.
+
 * Thu Aug 20 2026 Petr Sleptsov <spetr@bk.ru> - 0.10.1-1
 - Add blitzctl control utility for cache management: list cached hosts,
   browse the per-host resource filesystem tree, inspect file details, and
