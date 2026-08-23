@@ -402,6 +402,36 @@ impl Config {
         PathBuf::from("/var/cache/apt-blitz")
     }
 
+    /// Load only the `url_maps` configuration, without parsing the full server
+    /// CLI (which is unsafe from the `blitzctl` binary that has its own CLI).
+    ///
+    /// Mirrors the server's effective resolution: `PROXY_URL_MAP` env
+    /// (comma‑delimited) takes precedence; otherwise the `url_map` key from a
+    /// discovered YAML config is used. Used by `blitzctl` to resolve cached
+    /// real hosts back to their configured aliases.
+    pub fn load_url_maps() -> anyhow::Result<Vec<UrlMap>> {
+        if let Ok(v) = std::env::var("PROXY_URL_MAP") {
+            if !v.trim().is_empty() {
+                return v
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(UrlMap::parse)
+                    .collect();
+            }
+        }
+        if let Some(path) = Self::discover() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(yaml) = serde_yaml::from_str::<YamlConfig>(&content) {
+                    if let Some(maps) = yaml.url_map {
+                        return maps.iter().map(|s| UrlMap::parse(s)).collect();
+                    }
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
     /// Auto‑discover config file at standard locations.
     fn discover() -> Option<PathBuf> {
         let candidates = [

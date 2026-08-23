@@ -35,7 +35,8 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cache_dir = cli.cache_dir.unwrap_or_else(Config::cache_dir_only);
+    let url_maps = Config::load_url_maps().unwrap_or_default();
     match cli.command {
-        Command::Cache { sub } => cache_cli::run(cache_dir, sub).await,
+        Command::Cache { sub } => cache_cli::run(cache_dir, url_maps, sub).await,
     }
 }

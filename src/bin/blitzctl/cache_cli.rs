@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use apt_blitz::cache::{time_until_expiry_map, Cache, CacheEntryDetail, CachedFile};
+use apt_blitz::config::UrlMap;
 use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
@@ -44,17 +45,22 @@ pub enum CacheCmd {
     },
 }
 
-pub async fn run(dir: PathBuf, sub: CacheCmd) -> anyhow::Result<()> {
+pub async fn run(
+    dir: PathBuf,
+    url_maps: Vec<UrlMap>,
+    sub: CacheCmd,
+) -> anyhow::Result<()> {
+    let maps = url_maps.as_slice();
     match sub {
-        CacheCmd::Hosts => cmd_hosts(&dir).await,
+        CacheCmd::Hosts => cmd_hosts(&dir, maps).await,
         CacheCmd::Tree {
             host,
             path,
             files,
-        } => cmd_tree(&dir, &host, &path, files).await,
-        CacheCmd::Info { url } => cmd_info(&dir, &url).await,
-        CacheCmd::Find { host, query } => cmd_find(&dir, &host, &query).await,
-        CacheCmd::Clear { target, yes } => cmd_clear(&dir, target, yes).await,
+        } => cmd_tree(&dir, maps, &host, &path, files).await,
+        CacheCmd::Info { url } => cmd_info(&dir, maps, &url).await,
+        CacheCmd::Find { host, query } => cmd_find(&dir, maps, &host, &query).await,
+        CacheCmd::Clear { target, yes } => cmd_clear(&dir, maps, target, yes).await,
     }
 }
 
@@ -80,6 +86,59 @@ fn normalize_target(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// A cached URL resolved against the configured `url_maps`.
+///
+/// `real_*` is the actual upstream host/path stored in the cache (post
+/// `resolve_url`); `disp_*` is the alias (`fake-host` + leftover path) shown
+/// to the user. When no mapping applies, `disp_*` equals `real_*`.
+struct Resolved {
+    real_host: String,
+    real_path: String,
+    disp_host: String,
+    disp_path: String,
+}
+
+impl Resolved {
+    fn new(url: &str, maps: &[UrlMap]) -> Self {
+        let (real_host, real_path) = host_and_path(url);
+        let (disp_host, disp_path) = reverse_resolve(url, maps);
+        Resolved {
+            real_host,
+            real_path,
+            disp_host,
+            disp_path,
+        }
+    }
+
+    /// Whether this entry belongs to the given host selector, matching either
+    /// the alias or the real host (so users may filter by either form).
+    fn host_matches(&self, host: &str) -> bool {
+        self.disp_host == host || self.real_host == host
+    }
+
+    /// Whether this entry's path (alias or real) starts with `prefix`.
+    fn path_matches(&self, prefix: &str) -> bool {
+        self.disp_path.starts_with(prefix) || self.real_path.starts_with(prefix)
+    }
+}
+
+/// Reverse of `resolve_url`: map a real upstream URL back to its configured
+/// alias (`fake-host` + leftover path) when it matches a `url_map`.
+///
+/// First match wins (consistent with `resolve_url`). Falls back to the real
+/// host/path when no mapping applies.
+fn reverse_resolve(url: &str, maps: &[UrlMap]) -> (String, String) {
+    for map in maps {
+        let base = map.real_base.trim_end_matches('/');
+        if let Some(rest) = url.strip_prefix(base) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return (map.fake_host.clone(), rest.to_string());
+            }
+        }
+    }
+    host_and_path(url)
 }
 
 struct Target {
@@ -228,7 +287,7 @@ fn print_tree(node: &TreeNode, prefix: &str, show_files: bool) {
 // Subcommands
 // ---------------------------------------------------------------------------
 
-async fn cmd_hosts(dir: &PathBuf) -> anyhow::Result<()> {
+async fn cmd_hosts(dir: &PathBuf, maps: &[UrlMap]) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!("cache is empty or not initialized at {}", dir.display());
         return Ok(());
@@ -240,14 +299,17 @@ async fn cmd_hosts(dir: &PathBuf) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut map: BTreeMap<String, (u64, usize)> = BTreeMap::new();
+    let mut map: BTreeMap<String, (u64, usize, BTreeSet<String>)> = BTreeMap::new();
     for e in &entries {
-        let (host, _) = host_and_path(&e.url);
-        let entry = map.entry(host).or_insert((0, 0));
+        let r = Resolved::new(&e.url, maps);
+        let entry = map
+            .entry(r.disp_host.clone())
+            .or_insert((0, 0, BTreeSet::new()));
         entry.0 += e.size;
         entry.1 += 1;
+        entry.2.insert(r.real_host.clone());
     }
-    let total: u64 = map.values().map(|(s, _)| *s).sum();
+    let total: u64 = map.values().map(|(s, _, _)| *s).sum();
 
     println!(
         "Cached hosts: {} hosts, {} files, {} total",
@@ -255,14 +317,27 @@ async fn cmd_hosts(dir: &PathBuf) -> anyhow::Result<()> {
         entries.len(),
         human_size(total)
     );
-    for (host, (size, count)) in &map {
-        println!("  {:<40} {:>10}  {} files", host, human_size(*size), count);
+    println!("  {:<32} {:<32} {:>10}  files", "ALIAS", "REAL HOST", "");
+    for (alias, (size, count, reals)) in &map {
+        let real = if reals.len() == 1 && reals.contains(alias) {
+            "-".to_string()
+        } else {
+            reals.iter().cloned().collect::<Vec<_>>().join(", ")
+        };
+        println!(
+            "  {:<32} {:<32} {:>10}  {}",
+            alias,
+            real,
+            human_size(*size),
+            count
+        );
     }
     Ok(())
 }
 
 async fn cmd_tree(
     dir: &PathBuf,
+    maps: &[UrlMap],
     host: &str,
     path_filter: &str,
     show_files: bool,
@@ -280,14 +355,11 @@ async fn cmd_tree(
         Some(path_filter.to_string())
     };
 
-    let filtered: Vec<(String, String, u64)> = entries
+    let filtered: Vec<(Resolved, u64)> = entries
         .iter()
-        .map(|e| {
-            let (h, p) = host_and_path(&e.url);
-            (h, p, e.size)
-        })
-        .filter(|(h, p, _)| {
-            h == host && prefix.as_ref().map_or(true, |pre| p.starts_with(pre))
+        .map(|e| (Resolved::new(&e.url, maps), e.size))
+        .filter(|(r, _)| {
+            r.host_matches(host) && prefix.as_ref().is_none_or(|pre| r.path_matches(pre))
         })
         .collect();
 
@@ -295,18 +367,30 @@ async fn cmd_tree(
         match prefix {
             Some(p) => println!("no entries for host '{}' under '{}'", host, p),
             None => println!("no entries for host '{}'", host),
-        }
+        };
         return Ok(());
     }
 
-    let mut root = TreeNode::new(host.to_string(), true);
-    for (_, path, size) in &filtered {
-        root.insert(path, *size);
+    let display_host = &filtered[0].0.disp_host;
+    let real_hosts: BTreeSet<&str> = filtered
+        .iter()
+        .map(|(r, _)| r.real_host.as_str())
+        .collect();
+    let real_str = if real_hosts.len() == 1 && real_hosts.contains(display_host.as_str()) {
+        "-".to_string()
+    } else {
+        real_hosts.iter().cloned().collect::<Vec<_>>().join(", ")
+    };
+
+    let mut root = TreeNode::new(display_host.to_string(), true);
+    for (r, size) in &filtered {
+        root.insert(&r.disp_path, *size);
     }
 
     println!(
-        "{}  ({} files, {})",
-        host,
+        "{}  (real: {})  ({} files, {})",
+        display_host,
+        real_str,
         root.file_count,
         human_size(root.size)
     );
@@ -340,38 +424,54 @@ fn basename(path: &str) -> &str {
 
 /// Pure matching core for `find`.
 ///
-/// `entries` is a list of `(host, path)`. Returns `(folders, files)` where
-/// each item is the full printable path (`host + path`, folders with a
-/// trailing `/`). The match is against the file/folder name unless `query`
-/// contains a `/`, in which case it is against the full path.
+/// `entries` are pre-resolved against `url_maps`. Returns `(folders, files)`
+/// where each item is a `(alias_path, real_path)` pair. The match is against
+/// the file/folder name unless `query` contains a `/`, in which case it is
+/// against the full path. Both the alias path and the real path are tested so
+/// queries may use either form.
 fn find_matches(
     host: &str,
     query: &str,
-    entries: &[(String, String)],
-) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
+    entries: &[Resolved],
+) -> anyhow::Result<(BTreeSet<(String, String)>, BTreeSet<(String, String)>)> {
     let re = glob_to_regex(query)?;
     let path_mode = query.contains('/');
 
-    let mut folders: BTreeSet<String> = BTreeSet::new();
-    let mut files: BTreeSet<String> = BTreeSet::new();
+    let mut folders: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut files: BTreeSet<(String, String)> = BTreeSet::new();
 
-    for (h, p) in entries {
-        if h != host {
+    for r in entries {
+        if !r.host_matches(host) {
             continue;
         }
-        let file_candidate = if path_mode { p.clone() } else { basename(p).to_string() };
-        if re.is_match(&file_candidate) {
-            files.insert(format!("{}{}", host, p));
+        let disp_candidate = if path_mode {
+            r.disp_path.clone()
+        } else {
+            basename(&r.disp_path).to_string()
+        };
+        let real_candidate = if path_mode {
+            r.real_path.clone()
+        } else {
+            basename(&r.real_path).to_string()
+        };
+        if re.is_match(&disp_candidate) || re.is_match(&real_candidate) {
+            files.insert((
+                format!("{}{}", r.disp_host, r.disp_path),
+                format!("{}{}", r.real_host, r.real_path),
+            ));
         }
 
-        let comps: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
+        let comps: Vec<&str> = r.disp_path.split('/').filter(|s| !s.is_empty()).collect();
         let mut acc = String::new();
         for c in &comps[..comps.len().saturating_sub(1)] {
             acc.push('/');
             acc.push_str(c);
             let folder_candidate = if path_mode { acc.clone() } else { c.to_string() };
-            if re.is_match(&folder_candidate) {
-                folders.insert(format!("{}{}/", host, acc));
+            if re.is_match(&folder_candidate) || re.is_match(&c) {
+                folders.insert((
+                    format!("{}{}/", r.disp_host, acc),
+                    format!("{}{}/", r.real_host, acc),
+                ));
             }
         }
     }
@@ -379,7 +479,7 @@ fn find_matches(
     Ok((folders, files))
 }
 
-async fn cmd_find(dir: &PathBuf, host: &str, query: &str) -> anyhow::Result<()> {
+async fn cmd_find(dir: &PathBuf, maps: &[UrlMap], host: &str, query: &str) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!("cache is empty or not initialized at {}", dir.display());
         return Ok(());
@@ -387,15 +487,12 @@ async fn cmd_find(dir: &PathBuf, host: &str, query: &str) -> anyhow::Result<()> 
     let cache = Cache::new(dir.clone(), u64::MAX)?;
     let entries = cache.list_all().await?;
 
-    let parsed: Vec<(String, String)> = entries
+    let resolved: Vec<Resolved> = entries
         .iter()
-        .map(|e| {
-            let (h, p) = host_and_path(&e.url);
-            (h, p)
-        })
+        .map(|e| Resolved::new(&e.url, maps))
         .collect();
 
-    let (folders, files) = find_matches(host, query, &parsed)?;
+    let (folders, files) = find_matches(host, query, &resolved)?;
 
     if folders.is_empty() && files.is_empty() {
         println!("no matches for host '{}' query '{}'", host, query);
@@ -409,16 +506,16 @@ async fn cmd_find(dir: &PathBuf, host: &str, query: &str) -> anyhow::Result<()> 
         folders.len(),
         files.len()
     );
-    for f in &folders {
-        println!("  {}", f);
+    for (alias, real) in &folders {
+        println!("  {}   (real: {})", alias, real);
     }
-    for f in &files {
-        println!("  {}", f);
+    for (alias, real) in &files {
+        println!("  {}   (real: {})", alias, real);
     }
     Ok(())
 }
 
-async fn cmd_info(dir: &PathBuf, url: &str) -> anyhow::Result<()> {
+async fn cmd_info(dir: &PathBuf, maps: &[UrlMap], url: &str) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!("cache is empty or not initialized at {}", dir.display());
         return Ok(());
@@ -431,16 +528,22 @@ async fn cmd_info(dir: &PathBuf, url: &str) -> anyhow::Result<()> {
             std::process::exit(1);
         }
         Some(d) => {
-            let (host, path) = host_and_path(&d.url);
+            let r = Resolved::new(&d.url, maps);
             let fresh = time_until_expiry_map(d.cached_at, &d.headers, 86400);
             let content_type = d.headers.get("content-type").map(String::as_str).unwrap_or("-");
             let fresh_str = match fresh {
                 Some(s) if s > 0 => format!("{}s remaining", s),
                 _ => "expired / not cacheable".to_string(),
             };
-            println!("URL:         {}", d.url);
-            println!("Host:        {}", host);
-            println!("Path:        {}", path);
+            println!("URL (real):   {}", d.url);
+            println!("Host (real):  {}", r.real_host);
+            println!("Path (real):  {}", r.real_path);
+            if r.disp_host != r.real_host {
+                println!("Mapping:      {}{}", r.disp_host, r.disp_path);
+                println!("Host (alias): {}", r.disp_host);
+            } else {
+                println!("Mapping:      -");
+            }
             println!("Size:        {} ({} bytes)", human_size(d.size), d.size);
             println!("Cached at:   {}", fmt_ts(d.cached_at));
             println!("Last access: {}", fmt_ts(d.last_access));
@@ -452,7 +555,12 @@ async fn cmd_info(dir: &PathBuf, url: &str) -> anyhow::Result<()> {
     }
 }
 
-async fn cmd_clear(dir: &PathBuf, target: Option<String>, yes: bool) -> anyhow::Result<()> {
+async fn cmd_clear(
+    dir: &PathBuf,
+    maps: &[UrlMap],
+    target: Option<String>,
+    yes: bool,
+) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!(
             "cache is empty or not initialized at {}; nothing to clear",
@@ -486,12 +594,12 @@ async fn cmd_clear(dir: &PathBuf, target: Option<String>, yes: bool) -> anyhow::
             let tgt = parse_target(&norm);
             let entries = cache.list_all().await?;
             let matches = |e: &CachedFile| -> bool {
-                let (h, p) = host_and_path(&e.url);
-                h == tgt.host
+                let r = Resolved::new(&e.url, maps);
+                r.host_matches(&tgt.host)
                     && tgt
                         .path_prefix
                         .as_ref()
-                        .map_or(true, |pre| p.starts_with(pre))
+                        .is_none_or(|pre| r.path_matches(pre))
             };
             let filtered: Vec<&CachedFile> = entries.iter().filter(|e| matches(e)).collect();
             if filtered.is_empty() {
@@ -607,22 +715,32 @@ mod tests {
 
     #[test]
     fn test_find_name_mode() {
+        let mk = |host: &str, path: &str| Resolved::new(&format!("http://{}{}", host, path), &[]);
         let entries = vec![
-            ("deb.debian.org".to_string(), "/pool/main/a.deb".to_string()),
-            ("deb.debian.org".to_string(), "/pool/main/b.deb".to_string()),
-            ("deb.debian.org".to_string(), "/pool/unstable/x.deb".to_string()),
-            ("other.host".to_string(), "/pool/main/a.deb".to_string()),
+            mk("deb.debian.org", "/pool/main/a.deb"),
+            mk("deb.debian.org", "/pool/main/b.deb"),
+            mk("deb.debian.org", "/pool/unstable/x.deb"),
+            mk("other.host", "/pool/main/a.deb"),
         ];
         // Name-only: `main` matches the folder, not the files.
         let (folders, files) = find_matches("deb.debian.org", "main", &entries).unwrap();
-        assert_eq!(folders, BTreeSet::from(["deb.debian.org/pool/main/".to_string()]));
+        assert_eq!(
+            folders,
+            BTreeSet::from([(
+                "deb.debian.org/pool/main/".to_string(),
+                "deb.debian.org/pool/main/".to_string()
+            )])
+        );
         assert!(files.is_empty());
 
         // Wildcard name: `*.deb` matches all cached files, no folder.
         let (folders, files) = find_matches("deb.debian.org", "*.deb", &entries).unwrap();
         assert!(folders.is_empty());
         assert_eq!(files.len(), 3);
-        assert!(files.contains("deb.debian.org/pool/unstable/x.deb"));
+        assert!(files.contains(&(
+            "deb.debian.org/pool/unstable/x.deb".to_string(),
+            "deb.debian.org/pool/unstable/x.deb".to_string()
+        )));
 
         // Host filter is honoured: a host with no entries yields nothing.
         let (folders, files) = find_matches("example.com", "main", &entries).unwrap();
@@ -632,20 +750,111 @@ mod tests {
 
     #[test]
     fn test_find_path_mode() {
+        let mk = |host: &str, path: &str| Resolved::new(&format!("http://{}{}", host, path), &[]);
         let entries = vec![
-            ("deb.debian.org".to_string(), "/pool/main/a.deb".to_string()),
-            ("deb.debian.org".to_string(), "/pool/main/b.deb".to_string()),
-            ("deb.debian.org".to_string(), "/dists/unstable/InRelease".to_string()),
+            mk("deb.debian.org", "/pool/main/a.deb"),
+            mk("deb.debian.org", "/pool/main/b.deb"),
+            mk("deb.debian.org", "/dists/unstable/InRelease"),
         ];
         // Path pattern: matches both the folder path and file paths.
         let (folders, files) = find_matches("deb.debian.org", "pool/main", &entries).unwrap();
-        assert_eq!(folders, BTreeSet::from(["deb.debian.org/pool/main/".to_string()]));
+        assert_eq!(
+            folders,
+            BTreeSet::from([(
+                "deb.debian.org/pool/main/".to_string(),
+                "deb.debian.org/pool/main/".to_string()
+            )])
+        );
         assert_eq!(files.len(), 2);
-        assert!(files.contains("deb.debian.org/pool/main/a.deb"));
+        assert!(files.contains(&(
+            "deb.debian.org/pool/main/a.deb".to_string(),
+            "deb.debian.org/pool/main/a.deb".to_string()
+        )));
 
         // Glob path pattern with a slash enables path matching.
         let (folders, files) = find_matches("deb.debian.org", "pool/*", &entries).unwrap();
-        assert_eq!(folders, BTreeSet::from(["deb.debian.org/pool/main/".to_string()]));
+        assert_eq!(
+            folders,
+            BTreeSet::from([(
+                "deb.debian.org/pool/main/".to_string(),
+                "deb.debian.org/pool/main/".to_string()
+            )])
+        );
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_reverse_resolve() {
+        let maps = vec![
+            UrlMap::parse("f=http://real.com/base").unwrap(),
+            UrlMap::parse("ftp-f=ftp://real.ftp/pub").unwrap(),
+        ];
+
+        // Match: real base + path → fake host + leftover path.
+        assert_eq!(
+            reverse_resolve("http://real.com/base/foo/bar.deb", &maps),
+            ("f".to_string(), "/foo/bar.deb".to_string())
+        );
+
+        // Root (no path after base) → fake host, empty path.
+        assert_eq!(
+            reverse_resolve("http://real.com/base", &maps),
+            ("f".to_string(), "".to_string())
+        );
+
+        // Trailing slash on base stripped: still matches.
+        assert_eq!(
+            reverse_resolve("http://real.com/base/", &maps),
+            ("f".to_string(), "/".to_string())
+        );
+
+        // Prefix that is only a string prefix, not a path boundary, must NOT match.
+        assert_eq!(
+            reverse_resolve("http://real.com/baseball", &maps),
+            (
+                "real.com".to_string(),
+                "/baseball".to_string()
+            )
+        );
+
+        // FTP mapping.
+        assert_eq!(
+            reverse_resolve("ftp://real.ftp/pub/file.iso", &maps),
+            ("ftp-f".to_string(), "/file.iso".to_string())
+        );
+
+        // No mapping → falls back to real host/path.
+        assert_eq!(
+            reverse_resolve("http://other.com/x", &maps),
+            ("other.com".to_string(), "/x".to_string())
+        );
+
+        // First match wins.
+        let maps2 = vec![
+            UrlMap::parse("a=http://first.com").unwrap(),
+            UrlMap::parse("b=http://first.com/x").unwrap(),
+        ];
+        assert_eq!(
+            reverse_resolve("http://first.com/x", &maps2),
+            ("a".to_string(), "/x".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolved_host_and_path_match() {
+        let maps = vec![UrlMap::parse("f=http://real.com/base").unwrap()];
+
+        // Entry under the mapped base: matches either alias or real host.
+        let r = Resolved::new("http://real.com/base/pool/a.deb", &maps);
+        assert!(r.host_matches("f"));
+        assert!(r.host_matches("real.com"));
+        assert!(!r.host_matches("other"));
+        assert!(r.path_matches("/pool"));
+        assert!(r.path_matches("/base/pool"));
+
+        // No mapping: alias equals real, matches by real host only.
+        let r2 = Resolved::new("http://other.com/pool/a.deb", &[]);
+        assert!(r2.host_matches("other.com"));
+        assert!(!r2.host_matches("f"));
     }
 }

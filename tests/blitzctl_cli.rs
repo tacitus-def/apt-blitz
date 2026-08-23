@@ -59,10 +59,17 @@ async fn blitzctl_cache_workflow() {
     assert!(out.contains("deb.debian.org"), "hosts: {}", out);
     assert!(out.contains("security.debian.org"), "hosts: {}", out);
 
-    // tree (level 2)
+    // tree (level 2) — files are hidden by default, shown with --files
     let out = run(&dir, &["cache", "tree", "deb.debian.org"]);
     assert!(out.contains("pool/"), "tree: {}", out);
-    assert!(out.contains("apt_1.0_all.deb"), "tree: {}", out);
+    assert!(
+        !out.contains("apt_1.0_all.deb"),
+        "tree should hide files by default: {}",
+        out
+    );
+
+    let out = run(&dir, &["cache", "tree", "deb.debian.org", "--files"]);
+    assert!(out.contains("apt_1.0_all.deb"), "tree --files: {}", out);
 
     // info (exact file)
     let out = run(
@@ -74,7 +81,7 @@ async fn blitzctl_cache_workflow() {
         ],
     );
     assert!(
-        out.contains("Host:        deb.debian.org"),
+        out.contains("Host (real):  deb.debian.org"),
         "info: {}",
         out
     );
