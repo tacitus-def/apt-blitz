@@ -1,3 +1,17 @@
+apt-blitz (0.13.0-1) unstable; urgency=medium
+
+  * blitzctl: add `cache cat` (print the raw streamed contents of a single
+    cached file to stdout) and `cache cp` (copy a single cached file to the
+    local filesystem; an existing destination directory places the file
+    inside it, and overwriting an existing file requires --force). Both
+    require an unambiguous exact HOST + PATH match — no glob patterns — and
+    verify the copied/emitted byte count against the cached size.
+  * blitzctl cache info: report file checksums (MD5, SHA1, SHA256, SHA512)
+    computed on the fly from the stored file; shown as "-" when the file is
+    missing or unreadable.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Wed, 09 Sep 2026 12:00:00 +0300
+
 apt-blitz (0.12.2-1) unstable; urgency=medium
 
   * blitzctl: rename the cache removal subcommand from `cache clear` to

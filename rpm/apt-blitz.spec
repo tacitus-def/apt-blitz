@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.12.2
+Version:    0.13.0
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -69,6 +69,15 @@ exit 0
 %doc README.md
 
 %changelog
+* Wed Sep 09 2026 Petr Sleptsov <spetr@bk.ru> - 0.13.0-1
+- Add blitzctl cache cat (raw streamed contents of a single cached file to
+  stdout) and cache cp (copy a single cached file to the local filesystem;
+  existing destination directory places the file inside, overwriting an
+  existing file requires --force). Both need an unambiguous exact HOST+PATH
+  match and verify the copied/emitted byte count against the cached size.
+- blitzctl cache info reports file checksums (MD5, SHA1, SHA256, SHA512)
+  computed on the fly from the stored file.
+
 * Fri Aug 21 2026 Petr Sleptsov <spetr@bk.ru> - 0.11.0-1
 - blitzctl cache tree now hides individual files by default; use --files/-f
   to also list them.
