@@ -23,10 +23,13 @@ pub enum CacheCmd {
         #[arg(long, short)]
         files: bool,
     },
-    /// Show details of a single cached file by its exact URL
+    /// Show details of a single cached file by host + exact path
     Info {
-        /// Exact cached URL
-        url: String,
+        /// Resource host (alias or real), e.g. deb.debian.org
+        host: String,
+        /// Exact file path within the host, e.g. pool/main/a.deb
+        #[arg(default_value = "")]
+        path: String,
     },
     /// Search files and folders within a host by partial/full match
     Find {
@@ -36,19 +39,23 @@ pub enum CacheCmd {
         /// against the full path; otherwise against the name (last component).
         query: String,
     },
-    /// Clear the cache (all, or by host/path selector)
-    Clear {
+    /// Remove cached entries (all, or by host/path selector)
+    Rm {
         /// Optional selector: `host` or `host/path` (prefix or exact file)
         target: Option<String>,
-        /// Skip the confirmation prompt (full clear only)
+        /// Skip the confirmation prompt (full removal only)
         #[arg(long, short)]
         yes: bool,
     },
     /// List cached entries (like `ls` over the cache URL namespace)
     Ls {
-        /// Selector: `host`, `host/path`, or a glob like `host/path/*.deb`.
-        /// Empty lists all cached hosts.
-        target: Option<String>,
+        /// Resource host (alias or real), e.g. deb.debian.org. Empty lists
+        /// all cached hosts.
+        host: Option<String>,
+        /// Path prefix or glob within the host, e.g. `pool/main` or
+        /// `pool/*.deb`.
+        #[arg(default_value = "")]
+        path: String,
         /// Long format: cached_at, last access, seconds until expiry, size.
         #[arg(long, short)]
         long: bool,
@@ -93,11 +100,12 @@ pub async fn run(
             path,
             files,
         } => cmd_tree(&dir, maps, &host, &path, files).await,
-        CacheCmd::Info { url } => cmd_info(&dir, maps, &url).await,
+        CacheCmd::Info { host, path } => cmd_info(&dir, maps, &host, &path).await,
         CacheCmd::Find { host, query } => cmd_find(&dir, maps, &host, &query).await,
-        CacheCmd::Clear { target, yes } => cmd_clear(&dir, maps, target, yes).await,
+        CacheCmd::Rm { target, yes } => cmd_rm(&dir, maps, target, yes).await,
         CacheCmd::Ls {
-            target,
+            host,
+            path,
             long,
             human,
             recursive,
@@ -124,7 +132,7 @@ pub async fn run(
                 },
                 reverse,
             };
-            cmd_ls(&dir, maps, target, &opts).await
+            cmd_ls(&dir, maps, host, &path, &opts).await
         }
     }
 }
@@ -257,6 +265,28 @@ fn parse_target(s: &str) -> Target {
             host: s.to_string(),
             path_prefix: None,
         },
+    }
+}
+
+/// Strict positional interface: a `HOST` argument must be a plain hostname.
+fn validate_host(host: &str) -> anyhow::Result<()> {
+    if host.contains('/') {
+        anyhow::bail!(
+            "host '{}' must be a plain hostname; use `blitzctl cache <cmd> HOST [PATH]`",
+            host
+        );
+    }
+    Ok(())
+}
+
+/// Join a host and an optional path into a single `host[/path]` selector,
+/// tolerating leading/trailing slashes in `path`.
+fn join_host_path(host: &str, path: &str) -> String {
+    let p = path.trim_matches('/');
+    if p.is_empty() {
+        host.to_string()
+    } else {
+        format!("{}/{}", host, p)
     }
 }
 
@@ -603,43 +633,77 @@ async fn cmd_find(
     Ok(())
 }
 
-async fn cmd_info(dir: &PathBuf, maps: &[UrlMap], url: &str) -> anyhow::Result<()> {
+async fn cmd_info(
+    dir: &PathBuf,
+    maps: &[UrlMap],
+    host: &str,
+    path: &str,
+) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!("cache is empty or not initialized at {}", dir.display());
         return Ok(());
     }
-    let cache = Cache::new(dir.clone(), u64::MAX)?;
-    let detail: Option<CacheEntryDetail> = cache.entry_by_url(url).await?;
-    match detail {
-        None => {
-            eprintln!("no cached entry for URL: {}", url);
-            std::process::exit(1);
-        }
-        Some(d) => {
-            let r = Resolved::new(&d.url, maps);
-            let fresh = time_until_expiry_map(d.cached_at, &d.headers, 86400);
-            let content_type = d.headers.get("content-type").map(String::as_str).unwrap_or("-");
-            let fresh_str = match fresh {
-                Some(s) if s > 0 => format!("{}s remaining", s),
-                _ => "expired / not cacheable".to_string(),
-            };
-            // `info` is queried by the real cached URL, so only the real
-            // host/path is shown (no alias).
-            println!("URL:         {}", d.url);
-            println!("Host:        {}", r.real_host);
-            println!("Path:        {}", r.real_path);
-            println!("Size:        {} ({} bytes)", human_size(d.size), d.size);
-            println!("Cached at:   {}", fmt_ts(d.cached_at));
-            println!("Last access: {}", fmt_ts(d.last_access));
-            println!("Freshness:   {}", fresh_str);
-            println!("Content-Type:{}", content_type);
-            println!("Stored file: {}/{}", dir.display(), d.file_path);
-            Ok(())
-        }
+    validate_host(host)?;
+    if path.is_empty() {
+        anyhow::bail!("path is required; use `blitzctl cache info HOST PATH`");
     }
+    let cache = Cache::new(dir.clone(), u64::MAX)?;
+    let details = cache.list_all_detailed().await?;
+    let p = perspective_for(host, maps);
+    let matches = info_matches(host, path, maps, p, &details);
+    if matches.is_empty() {
+        eprintln!("no cached entry for host '{}' path '{}'", host, path);
+        std::process::exit(1);
+    }
+
+    let max_age = Config::max_cache_age_only();
+    for d in &matches {
+        if d.url != matches[0].url {
+            println!();
+        }
+        let r = Resolved::new(&d.url, maps);
+        let fresh = time_until_expiry_map(d.cached_at, &d.headers, max_age);
+        let content_type = d.headers.get("content-type").map(String::as_str).unwrap_or("-");
+        let fresh_str = match fresh {
+            Some(s) if s > 0 => format!("{}s remaining", s),
+            _ => "expired / not cacheable".to_string(),
+        };
+        println!("URL:         {}", d.url);
+        println!("Host:        {}", r.host(p));
+        println!("Path:        {}", r.path(p));
+        println!("Size:        {} ({} bytes)", human_size(d.size), d.size);
+        println!("Cached at:   {}", fmt_ts(d.cached_at));
+        println!("Last access: {}", fmt_ts(d.last_access));
+        println!("Freshness:   {}", fresh_str);
+        println!("Content-Type:{}", content_type);
+        println!("Stored file: {}/{}", dir.display(), d.file_path);
+    }
+    Ok(())
 }
 
-async fn cmd_clear(
+/// Collect all cached details whose perspective form matches `host` + `path`.
+///
+/// `host` may be a configured alias or the real upstream host. The path
+/// comparison is exact and tolerant of a leading slash (as entered by the
+/// user, without it).
+fn info_matches<'a>(
+    host: &str,
+    path: &str,
+    maps: &[UrlMap],
+    p: Perspective,
+    details: &'a [CacheEntryDetail],
+) -> Vec<&'a CacheEntryDetail> {
+    let want = path.trim_matches('/');
+    details
+        .iter()
+        .filter(|d| {
+            let r = Resolved::new(&d.url, maps);
+            r.host_matches(host) && r.path(p).trim_start_matches('/') == want
+        })
+        .collect()
+}
+
+async fn cmd_rm(
     dir: &PathBuf,
     maps: &[UrlMap],
     target: Option<String>,
@@ -647,7 +711,7 @@ async fn cmd_clear(
 ) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!(
-            "cache is empty or not initialized at {}; nothing to clear",
+            "cache is empty or not initialized at {}; nothing to remove",
             dir.display()
         );
         return Ok(());
@@ -671,7 +735,7 @@ async fn cmd_clear(
                 }
             }
             let removed = cache.clear_all().await?;
-            println!("cleared all cached entries ({} files removed)", removed);
+            println!("removed all cached entries ({} files removed)", removed);
         }
         Some(t) => {
             let norm = normalize_target(&t);
@@ -985,7 +1049,8 @@ fn render_level(
 async fn cmd_ls(
     dir: &PathBuf,
     maps: &[UrlMap],
-    target: Option<String>,
+    host_arg: Option<String>,
+    path: &str,
     opts: &LsOpts,
 ) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
@@ -1000,7 +1065,13 @@ async fn cmd_ls(
     }
 
     let max_age = Config::max_cache_age_only();
-    let target_str = target.unwrap_or_default();
+    let target_str = match host_arg {
+        None => String::new(),
+        Some(h) => {
+            validate_host(&h)?;
+            join_host_path(&h, path)
+        }
+    };
     let normalized = normalize_target(&target_str);
     let has_glob = normalized.contains('*') || normalized.contains('?');
 
@@ -1133,6 +1204,29 @@ mod tests {
             normalize_target("http://deb.debian.org/pool/x"),
             "deb.debian.org/pool/x"
         );
+    }
+
+    #[test]
+    fn test_join_host_path() {
+        assert_eq!(join_host_path("deb.debian.org", ""), "deb.debian.org");
+        assert_eq!(
+            join_host_path("deb.debian.org", "pool/main"),
+            "deb.debian.org/pool/main"
+        );
+        assert_eq!(
+            join_host_path("deb.debian.org", "/pool/main/"),
+            "deb.debian.org/pool/main"
+        );
+        assert_eq!(join_host_path("f", "pool/*.deb"), "f/pool/*.deb");
+        assert_eq!(join_host_path("deb.debian.org", "/"), "deb.debian.org");
+    }
+
+    #[test]
+    fn test_validate_host_rejects_slash() {
+        assert!(validate_host("deb.debian.org").is_ok());
+        assert!(validate_host("f").is_ok());
+        assert!(validate_host("deb.debian.org/pool").is_err());
+        assert!(validate_host("http://deb.debian.org/pool").is_err());
     }
 
     #[test]
@@ -1272,6 +1366,85 @@ mod tests {
             BTreeSet::from(["deb.debian.org/pool/main/".to_string()])
         );
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_info_matches_real_and_alias() {
+        let maps = vec![UrlMap::parse("f=http://real.com/base").unwrap()];
+        let mk = |url: &str| CacheEntryDetail {
+            url: url.to_string(),
+            file_path: url.to_string(),
+            size: 0,
+            last_access: 0,
+            cached_at: 0,
+            headers: std::collections::HashMap::new(),
+        };
+        let details = vec![
+            mk("http://real.com/base/pool/a.deb"),
+            mk("http://real.com/base/pool/b.deb"),
+            mk("http://other.com/x.deb"),
+        ];
+
+        // Real host form: path includes the mapping base prefix.
+        let m = info_matches(
+            "real.com",
+            "base/pool/a.deb",
+            &maps,
+            Perspective::Real,
+            &details,
+        );
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].url, "http://real.com/base/pool/a.deb");
+
+        // Alias form: host is the fake host, path is the leftover after base.
+        let m = info_matches("f", "pool/a.deb", &maps, Perspective::Alias, &details);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].url, "http://real.com/base/pool/a.deb");
+
+        // Mixed forms must not match: wrong path under the right perspective.
+        let m = info_matches("real.com", "pool/a.deb", &maps, Perspective::Real, &details);
+        assert!(m.is_empty());
+        let m = info_matches("f", "base/pool/a.deb", &maps, Perspective::Alias, &details);
+        assert!(m.is_empty());
+
+        // Unknown host yields nothing.
+        let m = info_matches("nope", "pool/a.deb", &maps, Perspective::Real, &details);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn test_info_matches_leading_slash_insensitive() {
+        let mk = |url: &str| CacheEntryDetail {
+            url: url.to_string(),
+            file_path: url.to_string(),
+            size: 0,
+            last_access: 0,
+            cached_at: 0,
+            headers: std::collections::HashMap::new(),
+        };
+        let details = vec![mk("http://real.com/pool/a.deb")];
+
+        // The path may be typed with or without a leading slash.
+        let m = info_matches("real.com", "pool/a.deb", &[], Perspective::Real, &details);
+        assert_eq!(m.len(), 1);
+        let m = info_matches("real.com", "/pool/a.deb", &[], Perspective::Real, &details);
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
+    fn test_find_leading_slash_path_is_strict() {
+        // A wrong sub-path (not the exact file) must not match.
+        let mk = |url: &str| CacheEntryDetail {
+            url: url.to_string(),
+            file_path: url.to_string(),
+            size: 0,
+            last_access: 0,
+            cached_at: 0,
+            headers: std::collections::HashMap::new(),
+        };
+        let details = vec![mk("http://real.com/pool/main/a.deb")];
+        let m = info_matches("real.com", "pool/main", &[], Perspective::Real, &details);
+        assert!(m.is_empty());
     }
 
     #[test]

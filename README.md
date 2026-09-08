@@ -6,7 +6,7 @@ Inspired by `apt-cacher-ng` and `aria2` — combines request coalescing, range-b
 
 ## Features
 
-- **Multithreaded downloads** — Splits a single file into ranged chunks and downloads them in parallel (up to 32 connections). Adapts segment size dynamically based on per-worker throughput (64 K–4 M).
+- **Multithreaded downloads** — Splits a single file into ranged chunks and downloads them in parallel, starting with one worker and scaling up adaptively. Bounded by `--connections` (default 4) and the global worker cap `--max-workers`. Adapts segment size dynamically based on per-worker throughput (64 K–4 M).
 - **Request coalescing** — When multiple clients request the same URL simultaneously, only one upstream download is made; followers read from the same in-flight buffer.
 - **FTP support** — Proxies FTP URLs (`ftp://`), single-threaded and multithreaded (`PASV` + `REST`). Anonymous or password-authenticated.
 - **CONNECT tunnel** — Handles `CONNECT` for HTTPS, SOCKS5, and arbitrary TCP tunnels. Supports upstream HTTP/SOCKS5 proxy chaining and `NO_PROXY` bypass.
@@ -82,6 +82,7 @@ All options can be set via CLI flags or environment variables. A YAML config fil
 |------|-----|---------|-------------|
 | `--coalesce-follower-timeout-secs` | `PROXY_COALESCE_FOLLOWER_TIMEOUT_SECS` | `50` | Timeout (seconds) for a follower waiting for the leader's in-flight download buffer |
 | `--coalesce-max-retries` | `PROXY_COALESCE_MAX_RETRIES` | `3` | Max retries when the leader drops the download before the follower can attach to the buffer |
+| `--coalesce-etag-max-retries` | `PROXY_COALESCE_ETAG_MAX_RETRIES` | `8` | Max retries when an upstream file changes mid-download (`If-Match` 412). Such failures are transient mirror re-syncs, so the download retries with the new generation instead of being treated as an upstream outage |
 
 ```bash
 # All environment variables
@@ -114,6 +115,7 @@ upstream_bandwidth: 50M
 per_ip_bandwidth: 10M
 coalesce_follower_timeout_secs: 50
 coalesce_max_retries: 3
+coalesce_etag_max_retries: 8
 ```
 
 Auto-discovery locations (in order):
@@ -141,6 +143,54 @@ the proxy revalidates the file with a conditional `HEAD`
 Files without validators (no `ETag` / `Last-Modified`, including FTP)
 are re-downloaded once their freshness window expires. Set
 `--max-cache-age 0` to revalidate on every request.
+
+## blitzctl — cache control utility
+
+`apt-blitz` ships a companion utility, `blitzctl`, for inspecting and
+managing the on-disk cache. It works directly against the SQLite database,
+so it can be used while the proxy is running.
+
+```bash
+blitzctl cache --help
+```
+
+The cache directory is resolved like the service does (YAML `cache_dir` →
+`PROXY_CACHE_DIR` → `/var/cache/apt-blitz`) and can be overridden with the
+`--cache-dir` global flag.
+
+All commands accept a `HOST` that may be a configured `--url-map` alias or
+the real upstream host. Filtering matches either form, and output is shown
+in the matching perspective (alias vs real).
+
+| Command | Description |
+|---------|-------------|
+| `cache hosts` | List cached resource hosts with totals (alias, real host, size, file count). |
+| `cache tree <HOST> [<PATH>]` | Show the per-host resource filesystem tree. Files are hidden by default; add `--files`/`-f` to list them. |
+| `cache find <HOST> <QUERY>` | Search files/folders within a host by name. `*` and `?` are wildcards; a `/` in the query matches against the full path. |
+| `cache ls [<HOST>] [<PATH>]` | List cached entries like the system `ls`, optionally limited to `HOST` and a `PATH` prefix or glob. |
+| `cache info <HOST> <PATH>` | Show details of a single cached file (URL, perspective host/path, size, timestamps, freshness, content type). |
+| `cache rm [<TARGET>] [--yes]` | Remove all cached entries, or only those matching `TARGET` (`host` or `host/path`, prefix or exact file). Full removal asks for confirmation unless `--yes` is given. |
+
+`cache ls` mirrors `ls(1)` flags: `-l` (long format — cached date, last
+access, seconds until expiry, size), `--human` (human-readable sizes),
+`-R` (recursive), `-1` (one entry per line), sorting by `-N` name (default),
+`-t` last access, `-c` cache time, `-S` size, and `-r` to reverse.
+Directories are always listed first.
+
+`cache ls` and `cache info` take `HOST` and `PATH` as separate positional
+arguments, like the other commands — URLs and single-token `host/path`
+selectors are rejected.
+
+Examples (add `--cache-dir PATH` to target a non-default cache):
+
+```bash
+blitzctl cache hosts
+blitzctl cache tree deb.debian.org --files
+blitzctl cache find deb.debian.org '*.deb'
+blitzctl cache ls -S security.debian.org pool
+blitzctl cache info deb.debian.org pool/main/a/apt_1.0_all.deb
+blitzctl cache rm deb.debian.org --yes
+```
 
 ## Architecture
 

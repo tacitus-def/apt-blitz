@@ -1,0 +1,160 @@
+.\" Man page for blitzctl
+.\" Generated from source; do not edit manually.
+.\"
+.TH BLITZCTL 1 "2026-09-08" "0.12.2" "User Commands"
+.SH NAME
+blitzctl \- control utility for the apt-blitz on-disk cache
+.SH SYNOPSIS
+.B blitzctl
+[\fI\,OPTIONS\/\fR] \fI\,COMMAND\/\fR [\fI\,ARGS\/\fR]
+.br
+.B blitzctl cache
+\fI\,SUBCOMMAND\/\fR [\fI\,ARGS\/\fR]
+.SH DESCRIPTION
+\fBblitzctl\fR is a companion utility for the \fBapt-blitz\fR HTTP forward
+proxy.  It inspects and manages the on-disk cache directly against the
+SQLite database, so it can be used while the proxy is running.
+.P
+The cache directory is resolved the same way as the service: the YAML
+\fIcache_dir\fR option, then the \fBPROXY_CACHE_DIR\fR environment variable,
+then the compiled-in default \fB/var/cache/apt-blitz\fR.  The
+.B \-\-cache\-dir
+option overrides it.
+.P
+Every command accepts a \fIHOST\fR argument that may be a configured
+.B \-\-url\-map
+alias or the real upstream host.  Filtering matches either form, and output
+is shown in the matching alias/real perspective.
+.SH GLOBAL OPTIONS
+.TP
+.B \-\-cache\-dir \fI\,PATH\/\fR
+Cache directory (overrides config/env default).
+.TP
+.B \-\-help
+Print help information and exit.
+.TP
+.B \-V, \-\-version
+Print version information and exit.
+.SH CACHE SUBCOMMANDS
+.SS hosts
+List cached resource hosts with totals (alias, real host, size, file count).
+.br
+Usage: \fBblitzctl cache hosts\fR
+.SS tree
+Show the per-host resource filesystem tree.  Individual files are hidden by
+default; use \fB\-\-files\fR/\fB\-f\fR to list them.
+.br
+Usage: \fBblitzctl cache tree\fR \fIHOST\fR [\fIPATH\fR]
+.br
+.TP
+.B \-f, \-\-files
+Also list individual cached files.
+.SS find
+Search files and folders within a host by name.  \fB*\fR matches any run of
+characters and \fB?\fR matches any single character; the match is
+case-insensitive.  A \fB/\fR in the query matches against the full path,
+otherwise the match is against the name (last component).
+.br
+Usage: \fBblitzctl cache find\fR \fIHOST\fR \fIQUERY\fR
+.SS ls
+List cached entries like the system \fB\&ls\fR over the cache URL namespace,
+optionally limited to \fIHOST\fR and a \fIPATH\fR prefix or glob.  Both take
+the form \fBblitzctl cache ls\fR [\fIHOST\fR] [\fIPATH\fR]; when \fIHOST\fR
+is omitted all cached hosts are listed.  \fIHOST\fR and \fIPATH\fR are
+separate positional arguments: URLs and single\-token \fBhost/path\fR
+selectors are rejected.
+.br
+Usage: \fBblitzctl cache ls\fR [\fIOPTIONS\fR] [\fIHOST\fR] [\fIPATH\fR]
+.TP
+.B \-l, \-\-long
+Long format: cached date, last access, seconds until expiry, size.
+.TP
+.B \-\-human
+Human-readable sizes (e.g. \fB1.0 MiB\fR).
+.TP
+.B \-R, \-\-recursive
+Recurse into subdirectories.
+.TP
+.B \-1, \-\-oneline
+Print one entry per line (default when output is not a terminal).
+.TP
+.B \-N, \-\-name
+Sort by name (default).
+.TP
+.B \-t, \-\-time
+Sort by last access time (newest first).
+.TP
+.B \-c, \-\-cached
+Sort by cache time (\fIcached_at\fR, newest first).
+.TP
+.B \-S, \-\-size
+Sort by size (largest first).
+.TP
+.B \-r, \-\-reverse
+Reverse the sort order.
+.P
+Directories are always listed first, regardless of the sort key.
+.SS info
+Show details of a single cached file: URL, host/path in the active
+perspective, size, cached time, last access, freshness (seconds until
+expiry), content type, and the stored file location.
+.br
+Usage: \fBblitzctl cache info\fR \fIHOST\fR \fIPATH\fR
+.SS rm
+Remove cached entries: all entries, or only those matching \fITARGET\fR
+(\fBhost\fR or \fBhost/path\fR, prefix or exact file).  Removing the entire
+cache asks for confirmation (type \fByes\fR) unless \fB\-\-yes\fR is given.
+.br
+Usage: \fBblitzctl cache rm\fR [\fIOPTIONS\fR] [\fITARGET\fR]
+.TP
+.B \-y, \-\-yes
+Skip the confirmation prompt (full removal only).
+.SH EXAMPLES
+.TP
+List cached hosts:
+.RS
+.B blitzctl cache hosts
+.RE
+.TP
+Browse a host's filesystem tree including files:
+.RS
+.B blitzctl cache tree
+\fIdeb.debian.org\fR
+.B \-\-files
+.RE
+.TP
+Search for \fI.deb\fR packages on a host:
+.RS
+.B blitzctl cache find
+\fIdeb.debian.org\fR
+.B "*\.deb"
+.RE
+.TP
+List the largest cached entries under a path:
+.RS
+.B blitzctl cache ls
+.B \-S
+\fIsecurity.debian.org\fR
+\fIpool\fR
+.RE
+.TP
+Show details of a single cached file:
+.RS
+.B blitzctl cache info
+\fIdeb.debian.org\fR
+\fIpool/main/a/apt_1.0_all.deb\fR
+.RE
+.TP
+Remove cached entries for a host selector:
+.RS
+.B blitzctl cache rm
+\fIdeb.debian.org\fR
+.B \-\-yes
+.RE
+.SH FILES
+.TP
+.I /var/cache/apt-blitz
+Default cache directory (contains the \fBcache.db\fR SQLite database and the
+sharded cached files).
+.SH SEE ALSO
+.BR apt-blitz (1)

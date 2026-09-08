@@ -1,3 +1,27 @@
+apt-blitz (0.12.2-1) unstable; urgency=medium
+
+  * blitzctl: rename the cache removal subcommand from `cache clear` to
+    `cache rm`. No alias is kept. The full-clear confirmation prompt and
+    output messages now use "removed" to match the new name.
+  * Documentation: add the blitzctl cache-control section to README, ship a
+    new man/blitzctl.1 man page in RPM and DEB, document
+    --coalesce-etag-max-retries, and correct the FTPS and multithreaded
+    connection claims in README and the apt-blitz man page.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 08 Sep 2026 12:00:00 +0300
+
+apt-blitz (0.12.1-1) unstable; urgency=medium
+
+  * blitzctl cache ls and cache info take positional HOST and PATH
+    arguments (like tree/find/clear) instead of a target/URL selector.
+    HOST may be a configured url_map alias or the real upstream host; ls
+    builds the listing under the matching alias/real perspective and info
+    shows the entry in that perspective. Single-token or URL-style HOST
+    input is rejected. info now honours the configured max_cache_age when
+    reporting freshness instead of a hardcoded 86400.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Tue, 08 Sep 2026 12:00:00 +0300
+
 apt-blitz (0.12.0-1) unstable; urgency=medium
 
   * blitzctl cache ls: list cached entries like the system `ls` over the

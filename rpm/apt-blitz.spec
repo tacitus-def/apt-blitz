@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.12.0
+Version:    0.12.2
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -37,6 +37,7 @@ install -D -m 0755 target/release/blitzctl %{buildroot}%{_bindir}/blitzctl
 install -D -m 0644 debian/apt-blitz.service %{buildroot}%{_unitdir}/apt-blitz.service
 install -D -m 0644 debian/apt-blitz.default %{buildroot}%{_sysconfdir}/default/apt-blitz
 install -D -m 0644 man/apt-blitz.1 %{buildroot}%{_mandir}/man1/apt-blitz.1
+install -D -m 0644 man/blitzctl.1 %{buildroot}%{_mandir}/man1/blitzctl.1
 install -d -m 0750 %{buildroot}/var/cache/apt-blitz
 
 %pre
@@ -60,6 +61,7 @@ exit 0
 %{_bindir}/apt-blitz
 %{_bindir}/blitzctl
 %{_mandir}/man1/apt-blitz.1*
+%{_mandir}/man1/blitzctl.1*
 %{_unitdir}/apt-blitz.service
 %config(noreplace) %{_sysconfdir}/default/apt-blitz
 %attr(0750, apt-blitz, apt-blitz) %dir /var/cache/apt-blitz

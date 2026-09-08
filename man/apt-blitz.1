@@ -1,7 +1,7 @@
 .\" Man page for apt-blitz
 .\" Generated from source; do not edit manually.
 .\"
-.TH APT-BLITZ 1 "2026-08-24" "0.12.0" "User Commands"
+.TH APT-BLITZ 1 "2026-09-08" "0.12.2" "User Commands"
 .SH NAME
 apt-blitz \- multithreaded proxy for APT-like package managers
 .SH SYNOPSIS
@@ -19,7 +19,8 @@ Multithreaded download with adaptive segment sizing
 .IP \(bu 3
 Transparent caching via SQLite with WAL mode
 .IP \(bu 3
-FTP and FTPS protocol support
+FTP protocol support (plain \fBftp://\fR; \fBftps://\fR is parsed but not
+yet supported)
 .IP \(bu 3
 In\-flight request coalescing (deduplication)
 .IP \(bu 3
@@ -187,6 +188,16 @@ Default: \fB3\fR
 .br
 Env: \fBPROXY_COALESCE_MAX_RETRIES\fR
 .TP
+.B \-\-coalesce\-etag\-max\-retries \fI\,N\/\fR
+Max retries when an upstream file changes mid\-download
+(\fBIf\-Match\fR 412).  Such failures are transient mirror re\-syncs,
+so the download is retried with the new generation instead of being
+treated as an upstream outage.
+.br
+Default: \fB8\fR
+.br
+Env: \fBPROXY_COALESCE_ETAG_MAX_RETRIES\fR
+.TP
 .B \-h, \-\-help
 Print help message and exit.
 .TP
@@ -246,6 +257,9 @@ Equivalent to \fB\-\-coalesce\-follower\-timeout\-secs\fR.
 .TP
 .B PROXY_COALESCE_MAX_RETRIES
 Equivalent to \fB\-\-coalesce\-max\-retries\fR.
+.TP
+.B PROXY_COALESCE_ETAG_MAX_RETRIES
+Equivalent to \fB\-\-coalesce\-etag\-max\-retries\fR.
 .SH LOGGING
 When a request is served from a fresh cache hit, the log line
 .B cache hit (fresh)
@@ -314,6 +328,7 @@ upstream_bandwidth: 50M
 per_ip_bandwidth: 10M
 coalesce_follower_timeout_secs: 50
 coalesce_max_retries: 3
+coalesce_etag_max_retries: 8
 .RE
 .fi
 .SH AUTHORS

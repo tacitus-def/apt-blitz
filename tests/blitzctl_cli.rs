@@ -48,6 +48,20 @@ fn run(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// Like `run`, but includes stderr so CLI usage errors can be asserted.
+fn run_all(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new(BIN)
+        .args(["--cache-dir", dir.to_str().unwrap()])
+        .args(args)
+        .output()
+        .expect("failed to run blitzctl");
+    format!(
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 #[tokio::test]
 async fn blitzctl_cache_workflow() {
     let dir = std::env::temp_dir().join("apt-blitz-test-blitzctl-cli");
@@ -71,13 +85,14 @@ async fn blitzctl_cache_workflow() {
     let out = run(&dir, &["cache", "tree", "deb.debian.org", "--files"]);
     assert!(out.contains("apt_1.0_all.deb"), "tree --files: {}", out);
 
-    // info (exact file)
+    // info (exact file by host + path)
     let out = run(
         &dir,
         &[
             "cache",
             "info",
-            "http://deb.debian.org/pool/main/a/apt_1.0_all.deb",
+            "deb.debian.org",
+            "pool/main/a/apt_1.0_all.deb",
         ],
     );
     assert!(
@@ -91,9 +106,26 @@ async fn blitzctl_cache_workflow() {
         out
     );
 
-    // selective clear by host
-    let out = run(&dir, &["cache", "clear", "deb.debian.org", "--yes"]);
-    assert!(out.contains("removed 2"), "clear host: {}", out);
+    // info rejects URL/target-style input (strict HOST PATH)
+    let out = run_all(
+        &dir,
+        &["cache", "info", "http://deb.debian.org/pool/main/a/apt_1.0_all.deb"],
+    );
+    assert!(
+        out.contains("plain hostname"),
+        "info should reject a URL host: {}",
+        out
+    );
+    let out = run_all(&dir, &["cache", "info", "deb.debian.org"]);
+    assert!(
+        out.contains("path is required"),
+        "info should require a path: {}",
+        out
+    );
+
+    // selective rm by host
+    let out = run(&dir, &["cache", "rm", "deb.debian.org", "--yes"]);
+    assert!(out.contains("removed 2"), "rm host: {}", out);
 
     // security host remains
     let out = run(&dir, &["cache", "hosts"]);
@@ -108,9 +140,9 @@ async fn blitzctl_cache_workflow() {
         out
     );
 
-    // full clear
-    let out = run(&dir, &["cache", "clear", "--yes"]);
-    assert!(out.contains("cleared all"), "full clear: {}", out);
+    // full rm
+    let out = run(&dir, &["cache", "rm", "--yes"]);
+    assert!(out.contains("removed all"), "full rm: {}", out);
 
     // empty afterwards
     let out = run(&dir, &["cache", "hosts"]);
@@ -144,18 +176,18 @@ async fn blitzctl_cache_ls() {
     );
 
     // path level: pool -> main/
-    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool"]);
+    let out = run(&dir, &["cache", "ls", "deb.debian.org", "pool"]);
     assert!(out.contains("main/"), "ls pool: {}", out);
 
     // deeper path level: main -> a/ and b/ directories
-    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/main"]);
+    let out = run(&dir, &["cache", "ls", "deb.debian.org", "pool/main"]);
     assert!(out.contains("a/"), "ls main: {}", out);
     assert!(out.contains("b/"), "ls main: {}", out);
 
     // exact file: long format shows the file (not a directory)
     let out = run(
         &dir,
-        &["cache", "ls", "deb.debian.org/pool/main/a/apt_1.0_all.deb"],
+        &["cache", "ls", "deb.debian.org", "pool/main/a/apt_1.0_all.deb"],
     );
     assert!(out.contains("apt_1.0_all.deb"), "ls file: {}", out);
     assert!(
@@ -165,13 +197,13 @@ async fn blitzctl_cache_ls() {
     );
 
     // glob: match a directory name at a level
-    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/main/a*"]);
+    let out = run(&dir, &["cache", "ls", "deb.debian.org", "pool/main/a*"]);
     assert!(out.contains("a/"), "ls glob: {}", out);
-    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/*"]);
+    let out = run(&dir, &["cache", "ls", "deb.debian.org", "pool/*"]);
     assert!(out.contains("main/"), "ls glob: {}", out);
 
     // glob with no match -> message
-    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/*.deb"]);
+    let out = run(&dir, &["cache", "ls", "deb.debian.org", "pool/*.deb"]);
     assert!(
         out.contains("no entries match") || out.trim().is_empty(),
         "ls glob no-match: {}",
@@ -179,13 +211,16 @@ async fn blitzctl_cache_ls() {
     );
 
     // sort by size descending: a/ (2048) before b/ (1024)
-    let out = run(&dir, &["cache", "ls", "-S", "deb.debian.org/pool/main"]);
+    let out = run(&dir, &["cache", "ls", "-S", "deb.debian.org", "pool/main"]);
     let ia = out.find("a/").unwrap();
     let ib = out.find("b/").unwrap();
     assert!(ia < ib, "sort -S should put a/ before b/: {}", out);
 
     // reverse: b/ before a/
-    let out = run(&dir, &["cache", "ls", "-S", "-r", "deb.debian.org/pool/main"]);
+    let out = run(
+        &dir,
+        &["cache", "ls", "-S", "-r", "deb.debian.org", "pool/main"],
+    );
     let ia = out.find("a/").unwrap();
     let ib = out.find("b/").unwrap();
     assert!(ib < ia, "sort -Sr should put b/ before a/: {}", out);
@@ -199,6 +234,27 @@ async fn blitzctl_cache_ls() {
     assert!(
         !out.contains("deb.debian.org/pool/main/a/deb.debian.org"),
         "ls -R must not recurse into a phantom host directory: {}",
+        out
+    );
+
+    // legacy single-token host/path and URL selectors are rejected
+    for bad in [
+        &["cache", "ls", "deb.debian.org/pool"][..],
+        &["cache", "ls", "http://deb.debian.org/pool/main"][..],
+    ] {
+        let out = run_all(&dir, bad);
+        assert!(
+            out.contains("plain hostname"),
+            "ls should reject slash/URL in host: {}",
+            out
+        );
+    }
+    // a bare path-like positional is treated strictly as a HOST query: a
+    // non-hostname token simply matches nothing
+    let out = run(&dir, &["cache", "ls", "pool"]);
+    assert!(
+        out.contains("no entries for 'pool'"),
+        "ls bare path token should be treated as an unknown host: {}",
         out
     );
 
