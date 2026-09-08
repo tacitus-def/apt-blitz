@@ -1,10 +1,14 @@
 //! Cache management subcommands for `blitzctl`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 
 use apt_blitz::cache::{time_until_expiry_map, Cache, CacheEntryDetail, CachedFile};
+use anyhow::Context;
+use md5::Md5;
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 use apt_blitz::config::{Config, UrlMap};
 use clap::Subcommand;
 
@@ -30,6 +34,25 @@ pub enum CacheCmd {
         /// Exact file path within the host, e.g. pool/main/a.deb
         #[arg(default_value = "")]
         path: String,
+    },
+    /// Print the raw contents of a cached file to stdout
+    Cat {
+        /// Resource host (alias or real), e.g. deb.debian.org
+        host: String,
+        /// Exact file path within the host, e.g. pool/main/a.deb
+        path: String,
+    },
+    /// Copy a cached file to the local filesystem
+    Cp {
+        /// Overwrite the destination file if it already exists
+        #[arg(long, short)]
+        force: bool,
+        /// Resource host (alias or real), e.g. deb.debian.org
+        host: String,
+        /// Exact file path within the host, e.g. pool/main/a.deb
+        path: String,
+        /// Destination file, or an existing directory to place the file into
+        dest: String,
     },
     /// Search files and folders within a host by partial/full match
     Find {
@@ -101,6 +124,13 @@ pub async fn run(
             files,
         } => cmd_tree(&dir, maps, &host, &path, files).await,
         CacheCmd::Info { host, path } => cmd_info(&dir, maps, &host, &path).await,
+        CacheCmd::Cat { host, path } => cmd_cat(&dir, maps, &host, &path).await,
+        CacheCmd::Cp {
+            force,
+            host,
+            path,
+            dest,
+        } => cmd_cp(&dir, maps, force, &host, &path, &dest).await,
         CacheCmd::Find { host, query } => cmd_find(&dir, maps, &host, &query).await,
         CacheCmd::Rm { target, yes } => cmd_rm(&dir, maps, target, yes).await,
         CacheCmd::Ls {
@@ -633,6 +663,13 @@ async fn cmd_find(
     Ok(())
 }
 
+struct FileHashes {
+    md5: String,
+    sha1: String,
+    sha256: String,
+    sha512: String,
+}
+
 async fn cmd_info(
     dir: &PathBuf,
     maps: &[UrlMap],
@@ -672,6 +709,21 @@ async fn cmd_info(
         println!("Host:        {}", r.host(p));
         println!("Path:        {}", r.path(p));
         println!("Size:        {} ({} bytes)", human_size(d.size), d.size);
+        let hashes = compute_hashes(&dir.join(&d.file_path));
+        match &hashes {
+            Ok(h) => {
+                println!("MD5:         {}", h.md5);
+                println!("SHA1:        {}", h.sha1);
+                println!("SHA256:      {}", h.sha256);
+                println!("SHA512:      {}", h.sha512);
+            }
+            Err(_) => {
+                println!("MD5:         - (stored file missing or unreadable)");
+                println!("SHA1:        - (stored file missing or unreadable)");
+                println!("SHA256:      - (stored file missing or unreadable)");
+                println!("SHA512:      - (stored file missing or unreadable)");
+            }
+        }
         println!("Cached at:   {}", fmt_ts(d.cached_at));
         println!("Last access: {}", fmt_ts(d.last_access));
         println!("Freshness:   {}", fresh_str);
@@ -679,6 +731,178 @@ async fn cmd_info(
         println!("Stored file: {}/{}", dir.display(), d.file_path);
     }
     Ok(())
+}
+
+fn compute_hashes(path: &Path) -> anyhow::Result<FileHashes> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut md5 = Md5::new();
+    let mut sha1 = Sha1::new();
+    let mut sha256 = Sha256::new();
+    let mut sha512 = Sha512::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        md5.update(&buf[..n]);
+        sha1.update(&buf[..n]);
+        sha256.update(&buf[..n]);
+        sha512.update(&buf[..n]);
+    }
+    Ok(FileHashes {
+        md5: format!("{:x}", md5.finalize()),
+        sha1: format!("{:x}", sha1.finalize()),
+        sha256: format!("{:x}", sha256.finalize()),
+        sha512: format!("{:x}", sha512.finalize()),
+    })
+}
+
+async fn cmd_cat(
+    dir: &Path,
+    maps: &[UrlMap],
+    host: &str,
+    path: &str,
+) -> anyhow::Result<()> {
+    let d = resolve_cached_entry(dir, maps, host, path).await?;
+    let full = dir.join(&d.file_path);
+    let stdout = std::io::stdout();
+    let copied = pipe_file(&full, &mut stdout.lock())?;
+    if copied != d.size {
+        eprintln!(
+            "warning: wrote {} bytes, cache entry reports {} bytes",
+            copied, d.size
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_cp(
+    dir: &Path,
+    maps: &[UrlMap],
+    force: bool,
+    host: &str,
+    path: &str,
+    dest: &str,
+) -> anyhow::Result<()> {
+    let d = resolve_cached_entry(dir, maps, host, path).await?;
+    let src = dir.join(&d.file_path);
+    let dest_path = resolve_dest(dest, path)?;
+    let copied = copy_source(&src, &dest_path, force)?;
+    if copied != d.size {
+        eprintln!(
+            "warning: copied {} bytes, cache entry reports {} bytes",
+            copied, d.size
+        );
+    }
+    println!(
+        "copied {} -> {} ({} bytes)",
+        src.display(),
+        dest_path.display(),
+        copied
+    );
+    Ok(())
+}
+
+/// Load the cache and resolve a `host` + `path` selector to exactly one entry.
+async fn resolve_cached_entry(
+    dir: &Path,
+    maps: &[UrlMap],
+    host: &str,
+    path: &str,
+) -> anyhow::Result<CacheEntryDetail> {
+    if !dir.join("cache.db").exists() {
+        anyhow::bail!("cache is empty or not initialized at {}", dir.display());
+    }
+    validate_host(host)?;
+    if path.is_empty() {
+        anyhow::bail!("path is required");
+    }
+    let cache = Cache::new(dir.to_path_buf(), u64::MAX)?;
+    let details = cache.list_all_detailed().await?;
+    let p = perspective_for(host, maps);
+    Ok(resolve_unique(host, path, maps, p, &details)?.clone())
+}
+
+/// Resolve a `host` + `path` selector to exactly one cached entry.
+///
+/// Unlike `info`, `cat`/`cp` require an unambiguous full match: zero or
+/// multiple matches are both fatal. No glob patterns are supported.
+fn resolve_unique<'a>(
+    host: &str,
+    path: &str,
+    maps: &[UrlMap],
+    p: Perspective,
+    details: &'a [CacheEntryDetail],
+) -> anyhow::Result<&'a CacheEntryDetail> {
+    let matches = info_matches(host, path, maps, p, details);
+    match matches.as_slice() {
+        [only] => Ok(only),
+        [] => anyhow::bail!("no cached entry for host '{}' path '{}'", host, path),
+        many => {
+            let urls: Vec<&str> = many.iter().map(|d| d.url.as_str()).collect();
+            anyhow::bail!(
+                "ambiguous selector: exactly one match required but '{}' '{}' \
+                 matches {} entries (found {})",
+                host,
+                path,
+                many.len(),
+                urls.join(", ")
+            )
+        }
+    }
+}
+
+/// Resolve the destination path for `cp`.
+///
+/// If `dest` is an existing directory, the file is placed inside it under its
+/// original name. Otherwise `dest` is treated as a literal file path and its
+/// parent directory must already exist.
+fn resolve_dest(dest: &str, path: &str) -> anyhow::Result<PathBuf> {
+    let dest_path = PathBuf::from(dest);
+    if dest_path.is_dir() {
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("cannot derive file name from path '{}'", path))?;
+        return Ok(dest_path.join(name));
+    }
+    if let Some(parent) = dest_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.is_dir() {
+            anyhow::bail!(
+                "destination directory does not exist: {}",
+                parent.display()
+            );
+        }
+    }
+    Ok(dest_path)
+}
+
+/// Stream `src` into `out`, returning the number of bytes copied.
+fn pipe_file(src: &Path, out: &mut dyn std::io::Write) -> anyhow::Result<u64> {
+    let mut file = std::fs::File::open(src)
+        .with_context(|| format!("stored file missing: {}", src.display()))?;
+    Ok(std::io::copy(&mut file, out)?)
+}
+
+/// Copy `src` to `dest`, refusing to overwrite an existing file unless
+/// `force` is set. Returns the number of bytes copied.
+fn copy_source(src: &Path, dest: &Path, force: bool) -> anyhow::Result<u64> {
+    if dest.exists() && !force {
+        anyhow::bail!(
+            "destination exists: {} (use --force to overwrite)",
+            dest.display()
+        );
+    }
+    let mut input = std::fs::File::open(src)
+        .with_context(|| format!("cannot open source file: {}", src.display()))?;
+    let mut output = std::fs::File::create(dest)
+        .with_context(|| format!("cannot create destination file: {}", dest.display()))?;
+    let copied = std::io::copy(&mut input, &mut output)?;
+    output.flush()?;
+    Ok(copied)
 }
 
 /// Collect all cached details whose perspective form matches `host` + `path`.
@@ -1542,5 +1766,222 @@ mod tests {
         let r2 = Resolved::new("http://other.com/pool/a.deb", &[]);
         assert!(r2.host_matches("other.com"));
         assert!(!r2.host_matches("f"));
+    }
+
+    #[test]
+    fn test_compute_hashes_known_values() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("abc");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"abc").unwrap();
+        drop(f);
+
+        let h = compute_hashes(&path).unwrap();
+        assert_eq!(h.md5, "900150983cd24fb0d6963f7d28e17f72");
+        assert_eq!(h.sha1, "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(
+            h.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            h.sha512,
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+    }
+
+    #[test]
+    fn test_compute_hashes_empty_and_large() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let h = compute_hashes(&empty).unwrap();
+        assert_eq!(h.md5, "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(h.sha1, "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(
+            h.sha256,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            h.sha512,
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+             47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+
+        // Streams a payload larger than the internal 64 KiB buffer.
+        let big = dir.path().join("big");
+        let mut f = std::fs::File::create(&big).unwrap();
+        let block = vec![0u8; 4096];
+        for _ in 0..40 {
+            f.write_all(&block).unwrap();
+        }
+        drop(f);
+        let h2 = compute_hashes(&big).unwrap();
+        assert_eq!(h2.md5, "6cc3d8ecd5a9967c9227be8d17b988a6");
+        assert_eq!(h2.sha1, "c6323f046be19b282c7ea235a2627b7122d8d618");
+        assert_eq!(
+            h2.sha256,
+            "6cdd259c8ecbe61fbc369f3293c1961541386954a223b17a37899d7fd9ad42da"
+        );
+        assert_eq!(
+            h2.sha512,
+            "f3f4aa0929bcdef3fa44b24112a4dcb579e819e77316a7a2894d1de4ca0ec14f3\
+             caca7308e1f331ee6916f9483a7a54048a1e035374e4b9ef5228dd4f4d03bd3"
+        );
+    }
+
+    #[test]
+    fn test_compute_hashes_missing_file() {
+        let h = compute_hashes(Path::new("/nonexistent/definitely-missing"));
+        assert!(h.is_err());
+    }
+
+    fn detail(url: &str) -> CacheEntryDetail {
+        let hash = format!("{:x}", Sha256::digest(url.as_bytes()));
+        CacheEntryDetail {
+            url: url.to_string(),
+            file_path: format!("{}/{}", &hash[..2], hash),
+            size: 0,
+            last_access: 0,
+            cached_at: 0,
+            headers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_unique_single() {
+        let details = vec![detail("http://deb.debian.org/pool/main/a.deb")];
+        let r = resolve_unique("deb.debian.org", "/pool/main/a.deb", &[], Perspective::Real, &details);
+        assert!(r.is_ok());
+        assert_eq!(r.unwrap().url, "http://deb.debian.org/pool/main/a.deb");
+    }
+
+    #[test]
+    fn test_resolve_unique_none() {
+        let details = vec![detail("http://deb.debian.org/pool/main/a.deb")];
+        let r = resolve_unique("deb.debian.org", "/pool/main/missing.deb", &[], Perspective::Real, &details);
+        let msg = match r {
+            Err(e) => format!("{:#}", e),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("no cached entry"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_unique_ambiguous() {
+        // Same host+path cached under different upstream URLs (e.g. scheme/port variants).
+        let details = vec![
+            detail("http://deb.debian.org/pool/main/a.deb"),
+            detail("https://deb.debian.org/pool/main/a.deb"),
+        ];
+        let r = resolve_unique("deb.debian.org", "/pool/main/a.deb", &[], Perspective::Real, &details);
+        let msg = match r {
+            Err(e) => format!("{:#}", e),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(msg.contains("ambiguous"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_dest_directory_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+
+        // Existing directory → file inside it under the source name.
+        let d = resolve_dest(sub.to_str().unwrap(), "/pool/main/a.deb").unwrap();
+        assert_eq!(d, sub.join("a.deb"));
+
+        // Plain file path → used as-is.
+        let d2 = resolve_dest("out.bin", "/pool/main/b.bin").unwrap();
+        assert_eq!(d2, PathBuf::from("out.bin"));
+
+        // Missing parent directory → error.
+        let d3 = resolve_dest("/nonexistent/out/child.bin", "/pool/main/b.bin");
+        assert!(d3.is_err());
+    }
+
+    #[test]
+    fn test_copy_source_overwrite_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dest = dir.path().join("dest.bin");
+        std::fs::write(&src, b"abc").unwrap();
+
+        assert_eq!(copy_source(&src, &dest, false).unwrap(), 3);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abc");
+
+        // Existing destination without --force → error.
+        assert!(copy_source(&src, &dest, false).is_err());
+
+        // With --force → overwrites.
+        assert_eq!(copy_source(&src, &dest, true).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_pipe_file_streams_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("body.bin");
+        std::fs::write(&src, b"stream me").unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(pipe_file(&src, &mut out).unwrap(), 9);
+        assert_eq!(out, b"stream me");
+
+        assert!(pipe_file(Path::new("/nonexistent/missing.bin"), &mut out).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cmd_cp_integration() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf(), u64::MAX).unwrap();
+        let content = b"payload-from-cache";
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), content).unwrap();
+
+        let url = "http://deb.debian.org/pool/main/x.deb";
+        cache.store(url, tmp.path(), &http::HeaderMap::new()).await.unwrap();
+
+        let dest = dir.path().join("copy.deb");
+        cmd_cp(dir.path(), &[], false, "deb.debian.org", "pool/main/x.deb", dest.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+
+        // Copying again without --force must fail.
+        assert!(cmd_cp(dir.path(), &[], false, "deb.debian.org", "pool/main/x.deb", dest.to_str().unwrap())
+            .await
+            .is_err());
+
+        // --force overwrites.
+        cmd_cp(dir.path(), &[], true, "deb.debian.org", "pool/main/x.deb", dest.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn test_cmd_cat_output_matches_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf(), u64::MAX).unwrap();
+        let content = b"cat-me-please";
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), content).unwrap();
+
+        let url = "http://deb.debian.org/pool/main/y.deb";
+        cache.store(url, tmp.path(), &http::HeaderMap::new()).await.unwrap();
+
+        let d = resolve_cached_entry(dir.path(), &[], "deb.debian.org", "pool/main/y.deb")
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        let full = dir.path().join(&d.file_path);
+        assert_eq!(pipe_file(&full, &mut out).unwrap(), content.len() as u64);
+        assert_eq!(out, content);
     }
 }
