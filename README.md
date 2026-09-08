@@ -168,7 +168,9 @@ in the matching perspective (alias vs real).
 | `cache tree <HOST> [<PATH>]` | Show the per-host resource filesystem tree. Files are hidden by default; add `--files`/`-f` to list them. |
 | `cache find <HOST> <QUERY>` | Search files/folders within a host by name. `*` and `?` are wildcards; a `/` in the query matches against the full path. |
 | `cache ls [<HOST>] [<PATH>]` | List cached entries like the system `ls`, optionally limited to `HOST` and a `PATH` prefix or glob. |
-| `cache info <HOST> <PATH>` | Show details of a single cached file (URL, perspective host/path, size, timestamps, freshness, content type). |
+| `cache info <HOST> <PATH>` | Show details of a single cached file (URL, perspective host/path, size, MD5/SHA1/SHA256/SHA512 checksums, timestamps, freshness, content type). Checksums are computed on the fly from the stored file. |
+| `cache cat <HOST> <PATH>` | Print the raw contents of a single cached file to stdout (streamed). |
+| `cache cp [--force] <HOST> <PATH> <DEST>` | Copy a single cached file to the local filesystem. Existing directory `DEST` places the file inside it under its original name; otherwise `DEST` is the literal file path. Refuses to overwrite unless `--force`/`-f` is given. |
 | `cache rm [<TARGET>] [--yes]` | Remove all cached entries, or only those matching `TARGET` (`host` or `host/path`, prefix or exact file). Full removal asks for confirmation unless `--yes` is given. |
 
 `cache ls` mirrors `ls(1)` flags: `-l` (long format — cached date, last
@@ -177,9 +179,13 @@ access, seconds until expiry, size), `--human` (human-readable sizes),
 `-t` last access, `-c` cache time, `-S` size, and `-r` to reverse.
 Directories are always listed first.
 
-`cache ls` and `cache info` take `HOST` and `PATH` as separate positional
-arguments, like the other commands — URLs and single-token `host/path`
-selectors are rejected.
+`cache ls`, `cache info`, `cache cat`, and `cache cp` take `HOST` and
+`PATH` as separate positional arguments, like the other commands — URLs and
+single-token `host/path` selectors are rejected.
+
+`cache cat` and `cache cp` require an unambiguous match: the selector must
+resolve to exactly one cached entry. No glob patterns are supported — a
+selector that matches zero or more than one entry is an error.
 
 Examples (add `--cache-dir PATH` to target a non-default cache):
 
@@ -189,6 +195,8 @@ blitzctl cache tree deb.debian.org --files
 blitzctl cache find deb.debian.org '*.deb'
 blitzctl cache ls -S security.debian.org pool
 blitzctl cache info deb.debian.org pool/main/a/apt_1.0_all.deb
+blitzctl cache cat deb.debian.org pool/main/a/apt_1.0_all.deb > apt.deb
+blitzctl cache cp deb.debian.org pool/main/a/apt_1.0_all.deb .
 blitzctl cache rm deb.debian.org --yes
 ```
 

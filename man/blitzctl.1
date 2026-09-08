@@ -1,7 +1,7 @@
 .\" Man page for blitzctl
 .\" Generated from source; do not edit manually.
 .\"
-.TH BLITZCTL 1 "2026-09-08" "0.12.2" "User Commands"
+.TH BLITZCTL 1 "2026-09-09" "0.13.0" "User Commands"
 .SH NAME
 blitzctl \- control utility for the apt-blitz on-disk cache
 .SH SYNOPSIS
@@ -96,10 +96,34 @@ Reverse the sort order.
 Directories are always listed first, regardless of the sort key.
 .SS info
 Show details of a single cached file: URL, host/path in the active
-perspective, size, cached time, last access, freshness (seconds until
-expiry), content type, and the stored file location.
+perspective, size, file checksums (\fBMD5\fR, \fBSHA1\fR, \fBSHA256\fR,
+\fBSHA512\fR), cached time, last access, freshness (seconds until expiry),
+content type, and the stored file location.  The checksums are computed on
+the fly from the stored file and are marked \fB\- (stored file missing or
+unreadable)\fR when the file cannot be read.
 .br
 Usage: \fBblitzctl cache info\fR \fIHOST\fR \fIPATH\fR
+.SS cat
+Print the raw contents of a single cached file to stdout (streamed, without
+loading it into memory).  Like \fBinfo\fR, takes an unambiguous \fIHOST\fR +
+\fIPATH\fR pair; glob patterns are not supported and a selector that matches
+zero or more than one entry is an error.  Nothing but the file bytes is
+written to stdout.
+.br
+Usage: \fBblitzctl cache cat\fR \fIHOST\fR \fIPATH\fR
+.SS cp
+Copy a single cached file to the local filesystem, using the same
+unambiguous \fIHOST\fR + \fIPATH\fR selector as \fBinfo\fR.  If \fIDEST\fR
+is an existing directory, the file is placed inside it under its original
+name; otherwise \fIDEST\fR is used as the literal file path and its parent
+directory must already exist.  Refuses to overwrite an existing file unless
+\fB\-\-force\fR/\fB\-f\fR is given.  After the copy the byte count is
+checked against the cached size and a warning is printed on mismatch.
+.br
+Usage: \fBblitzctl cache cp\fR [\fIOPTIONS\fR] \fIHOST\fR \fIPATH\fR \fIDEST\fR
+.TP
+.B \-f, \-\-force
+Overwrite the destination file if it already exists.
 .SS rm
 Remove cached entries: all entries, or only those matching \fITARGET\fR
 (\fBhost\fR or \fBhost/path\fR, prefix or exact file).  Removing the entire
@@ -143,6 +167,21 @@ Show details of a single cached file:
 .B blitzctl cache info
 \fIdeb.debian.org\fR
 \fIpool/main/a/apt_1.0_all.deb\fR
+.RE
+.TP
+Print the raw contents of a cached file to stdout:
+.RS
+.B blitzctl cache cat
+\fIdeb.debian.org\fR
+\fIpool/main/a/apt_1.0_all.deb\fR
+.RE
+.TP
+Copy a cached file to the current directory (overwrite with \fB\-\-force\fR):
+.RS
+.B blitzctl cache cp
+\fIdeb.debian.org\fR
+\fIpool/main/a/apt_1.0_all.deb\fR
+\fI.\fR
 .RE
 .TP
 Remove cached entries for a host selector:
