@@ -402,6 +402,29 @@ impl Config {
         PathBuf::from("/var/cache/apt-blitz")
     }
 
+    /// Load only `max_cache_age` without parsing the full server CLI.
+    ///
+    /// Precedence: `PROXY_MAX_CACHE_AGE` env var → `max_cache_age` in a
+    /// discovered YAML config → compiled‑in default (86400). Used by
+    /// `blitzctl` so it can compute entry expiry without server-only flags.
+    pub fn max_cache_age_only() -> u64 {
+        if let Ok(v) = std::env::var("PROXY_MAX_CACHE_AGE") {
+            if let Ok(n) = v.trim().parse::<u64>() {
+                return n;
+            }
+        }
+        if let Some(path) = Self::discover() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(yaml) = serde_yaml::from_str::<YamlConfig>(&content) {
+                    if let Some(age) = yaml.max_cache_age {
+                        return age;
+                    }
+                }
+            }
+        }
+        86400
+    }
+
     /// Load only the `url_maps` configuration, without parsing the full server
     /// CLI (which is unsafe from the `blitzctl` binary that has its own CLI).
     ///

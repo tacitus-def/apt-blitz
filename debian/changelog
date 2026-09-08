@@ -1,3 +1,14 @@
+apt-blitz (0.12.0-1) unstable; urgency=medium
+
+  * blitzctl cache ls: list cached entries like the system `ls` over the
+    cache URL namespace. Supports a host/path selector and glob filters,
+    and the flags -l (long: cached_at, last access, seconds until expiry,
+    size), --human (human-readable sizes), -R (recursive), -1 (one per
+    line), and sorting by name (-N), time (-t), cache time (-c), size (-S),
+    with -r to reverse. Directories are always listed first.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Mon, 24 Aug 2026 12:00:00 +0300
+
 apt-blitz (0.11.2-1) unstable; urgency=medium
 
   * blitzctl: display a single host form based on the input. If the host

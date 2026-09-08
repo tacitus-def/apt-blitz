@@ -58,6 +58,8 @@ const SELECT_TOTAL_SIZE: &str = "SELECT COALESCE(SUM(size), 0) FROM cache_entrie
 const EVICT_OLDEST: &str = "SELECT url_hash, url, size, file_path FROM cache_entries ORDER BY last_access ASC LIMIT 1";
 
 const SELECT_ALL: &str = "SELECT url, file_path, size, last_access, cached_at FROM cache_entries";
+const SELECT_ALL_DETAILED: &str =
+    "SELECT url, file_path, size, last_access, cached_at, headers FROM cache_entries";
 const SELECT_ENTRY_FULL: &str =
     "SELECT file_path, size, last_access, headers, cached_at FROM cache_entries WHERE url_hash = ?1";
 const SELECT_ALL_FILE_PATHS: &str = "SELECT file_path FROM cache_entries";
@@ -80,6 +82,7 @@ pub struct CachedFile {
 }
 
 /// Full detail of a single cached entry, including stored response headers.
+#[derive(Clone)]
 pub struct CacheEntryDetail {
     pub url: String,
     pub file_path: String,
@@ -299,6 +302,35 @@ impl Cache {
                     size: row.get::<_, i64>(2)?.max(0) as u64,
                     last_access: row.get(3)?,
                     cached_at: row.get(4)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            anyhow::Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))?
+    }
+
+    /// Like [`Self::list_all`], but returns full entry detail including the
+    /// stored response headers (needed to compute freshness/expiry).
+    pub async fn list_all_detailed(&self) -> anyhow::Result<Vec<CacheEntryDetail>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(SELECT_ALL_DETAILED)?;
+            let rows = stmt.query_map([], |row| {
+                Ok(CacheEntryDetail {
+                    url: row.get(0)?,
+                    file_path: row.get(1)?,
+                    size: row.get::<_, i64>(2)?.max(0) as u64,
+                    last_access: row.get(3)?,
+                    cached_at: row.get(4)?,
+                    headers: serde_json::from_str::<StoredHeaders>(&row.get::<_, String>(5)?)
+                        .map(|s| s.inner)
+                        .unwrap_or_default(),
                 })
             })?;
             let mut out = Vec::new();
@@ -1181,6 +1213,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let cache = Cache::new(dir.clone(), 10_000).unwrap();
         assert!(cache.lookup("http://example.com/never-cached.deb").await.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_cache_list_all_detailed_includes_headers() {
+        let dir = std::env::temp_dir().join("apt-blitz-test-cache-detailed");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = Cache::new(dir.clone(), 10_000).unwrap();
+        let url = "http://example.com/detailed.deb";
+        let temp_dir = dir.join("tmp");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_path = temp_dir.join("d.download");
+        std::fs::write(&temp_path, b"payload").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("cache-control", "max-age=3600".parse().unwrap());
+        headers.insert("content-type", "application/octet-stream".parse().unwrap());
+        cache.store(url, &temp_path, &headers).await.unwrap();
+
+        let detailed = cache.list_all_detailed().await.unwrap();
+        assert_eq!(detailed.len(), 1);
+        let d = &detailed[0];
+        assert_eq!(d.url, url);
+        assert_eq!(d.size, 7);
+        assert_eq!(
+            d.headers.get("cache-control").unwrap(),
+            "max-age=3600"
+        );
+        assert_eq!(
+            d.headers.get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+        // cached_at must be a plausible recent timestamp
+        assert!(d.cached_at > 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -122,3 +122,85 @@ async fn blitzctl_cache_workflow() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn blitzctl_cache_ls() {
+    let dir = std::env::temp_dir().join("apt-blitz-test-blitzctl-ls");
+    let _ = std::fs::remove_dir_all(&dir);
+    populate(&dir).await;
+
+    // top-level: lists cached hosts as directories
+    let out = run(&dir, &["cache", "ls"]);
+    assert!(out.contains("deb.debian.org/"), "ls top: {}", out);
+    assert!(out.contains("security.debian.org/"), "ls top: {}", out);
+
+    // host level: immediate child is the pool/ directory
+    let out = run(&dir, &["cache", "ls", "deb.debian.org"]);
+    assert!(out.contains("pool/"), "ls host: {}", out);
+    assert!(
+        !out.contains("apt_1.0_all.deb"),
+        "ls host should not descend: {}",
+        out
+    );
+
+    // path level: pool -> main/
+    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool"]);
+    assert!(out.contains("main/"), "ls pool: {}", out);
+
+    // deeper path level: main -> a/ and b/ directories
+    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/main"]);
+    assert!(out.contains("a/"), "ls main: {}", out);
+    assert!(out.contains("b/"), "ls main: {}", out);
+
+    // exact file: long format shows the file (not a directory)
+    let out = run(
+        &dir,
+        &["cache", "ls", "deb.debian.org/pool/main/a/apt_1.0_all.deb"],
+    );
+    assert!(out.contains("apt_1.0_all.deb"), "ls file: {}", out);
+    assert!(
+        !out.contains("apt_1.0_all.deb/"),
+        "ls file must not be a directory: {}",
+        out
+    );
+
+    // glob: match a directory name at a level
+    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/main/a*"]);
+    assert!(out.contains("a/"), "ls glob: {}", out);
+    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/*"]);
+    assert!(out.contains("main/"), "ls glob: {}", out);
+
+    // glob with no match -> message
+    let out = run(&dir, &["cache", "ls", "deb.debian.org/pool/*.deb"]);
+    assert!(
+        out.contains("no entries match") || out.trim().is_empty(),
+        "ls glob no-match: {}",
+        out
+    );
+
+    // sort by size descending: a/ (2048) before b/ (1024)
+    let out = run(&dir, &["cache", "ls", "-S", "deb.debian.org/pool/main"]);
+    let ia = out.find("a/").unwrap();
+    let ib = out.find("b/").unwrap();
+    assert!(ia < ib, "sort -S should put a/ before b/: {}", out);
+
+    // reverse: b/ before a/
+    let out = run(&dir, &["cache", "ls", "-S", "-r", "deb.debian.org/pool/main"]);
+    let ia = out.find("a/").unwrap();
+    let ib = out.find("b/").unwrap();
+    assert!(ib < ia, "sort -Sr should put b/ before a/: {}", out);
+
+    // recursive lists headers and descends fully
+    let out = run(&dir, &["cache", "ls", "-R", "deb.debian.org"]);
+    assert!(out.contains("deb.debian.org:"), "ls -R: {}", out);
+    assert!(out.contains("pool/"), "ls -R: {}", out);
+    assert!(out.contains("apt_1.0_all.deb"), "ls -R: {}", out);
+    assert!(out.contains("b.deb"), "ls -R: {}", out);
+    assert!(
+        !out.contains("deb.debian.org/pool/main/a/deb.debian.org"),
+        "ls -R must not recurse into a phantom host directory: {}",
+        out
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

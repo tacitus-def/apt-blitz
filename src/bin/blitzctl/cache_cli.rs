@@ -1,10 +1,11 @@
 //! Cache management subcommands for `blitzctl`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use apt_blitz::cache::{time_until_expiry_map, Cache, CacheEntryDetail, CachedFile};
-use apt_blitz::config::UrlMap;
+use apt_blitz::config::{Config, UrlMap};
 use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
@@ -43,6 +44,40 @@ pub enum CacheCmd {
         #[arg(long, short)]
         yes: bool,
     },
+    /// List cached entries (like `ls` over the cache URL namespace)
+    Ls {
+        /// Selector: `host`, `host/path`, or a glob like `host/path/*.deb`.
+        /// Empty lists all cached hosts.
+        target: Option<String>,
+        /// Long format: cached_at, last access, seconds until expiry, size.
+        #[arg(long, short)]
+        long: bool,
+        /// Human-readable sizes (e.g. 1.0 MiB). `-h` is reserved by clap for
+        /// help, so this uses the long flag only.
+        #[arg(long)]
+        human: bool,
+        /// Recurse into subdirectories.
+        #[arg(long, short = 'R')]
+        recursive: bool,
+        /// One entry per line.
+        #[arg(long, short = '1')]
+        oneline: bool,
+        /// Sort by name (default).
+        #[arg(long, short = 'N')]
+        name: bool,
+        /// Sort by last access time (newest first).
+        #[arg(long, short = 't')]
+        time: bool,
+        /// Sort by cache time (cached_at, newest first).
+        #[arg(long, short = 'c')]
+        cached: bool,
+        /// Sort by size (largest first).
+        #[arg(long, short = 'S')]
+        size: bool,
+        /// Reverse the sort order.
+        #[arg(long, short = 'r')]
+        reverse: bool,
+    },
 }
 
 pub async fn run(
@@ -61,6 +96,36 @@ pub async fn run(
         CacheCmd::Info { url } => cmd_info(&dir, maps, &url).await,
         CacheCmd::Find { host, query } => cmd_find(&dir, maps, &host, &query).await,
         CacheCmd::Clear { target, yes } => cmd_clear(&dir, maps, target, yes).await,
+        CacheCmd::Ls {
+            target,
+            long,
+            human,
+            recursive,
+            oneline,
+            name: _,
+            time,
+            cached,
+            size,
+            reverse,
+        } => {
+            let opts = LsOpts {
+                long,
+                human,
+                recursive,
+                oneline,
+                sort: if size {
+                    SortKey::Size
+                } else if time {
+                    SortKey::Time
+                } else if cached {
+                    SortKey::Cached
+                } else {
+                    SortKey::Name
+                },
+                reverse,
+            };
+            cmd_ls(&dir, maps, target, &opts).await
+        }
     }
 }
 
@@ -641,6 +706,406 @@ async fn cmd_clear(
 }
 
 // ---------------------------------------------------------------------------
+// ls
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum SortKey {
+    Name,
+    Time,
+    Cached,
+    Size,
+}
+
+struct LsOpts {
+    long: bool,
+    human: bool,
+    recursive: bool,
+    oneline: bool,
+    sort: SortKey,
+    reverse: bool,
+}
+
+/// A single entry in an `ls` listing (file or aggregated directory).
+struct LsItem {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    cached_at: i64,
+    last_access: i64,
+    expiry: Option<u64>,
+    file_count: usize,
+}
+
+/// Longest prefix of `target` ending at a `/` that contains no glob metachar,
+/// i.e. the directory under which a glob pattern is applied. Returns an empty
+/// string when the target has no glob metacharacters.
+fn glob_base(target: &str) -> String {
+    let idx = match target.find(['*', '?']) {
+        Some(i) => i,
+        None => return String::new(),
+    };
+    let before = &target[..idx];
+    match before.rfind('/') {
+        Some(i) => target[..=i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Build the immediate children (files + aggregated dirs) of `base` from the
+/// already-matched `(root_path, detail)` pairs. Returns the children plus an
+/// optional exact file when `base` itself matches a single cached entry.
+fn collect_children(
+    matched: &[(String, CacheEntryDetail)],
+    base: &str,
+    max_age: u64,
+) -> (Vec<LsItem>, Option<CacheEntryDetail>) {
+    let mut children: BTreeMap<String, LsItem> = BTreeMap::new();
+    let mut exact: Option<CacheEntryDetail> = None;
+
+        for (root, d) in matched {
+        if !root.starts_with(base) {
+            continue;
+        }
+        let rel = root[base.len()..].trim_start_matches('/');
+        if rel.is_empty() {
+            exact = Some((*d).clone());
+            continue;
+        }
+        let name = match rel.split('/').next() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let is_dir = rel.contains('/');
+        let entry = children.entry(name.clone()).or_insert(LsItem {
+            name,
+            is_dir,
+            size: 0,
+            cached_at: 0,
+            last_access: 0,
+            expiry: None,
+            file_count: 0,
+        });
+        entry.is_dir = entry.is_dir || is_dir;
+        if is_dir {
+            entry.size += d.size;
+            entry.file_count += 1;
+            entry.last_access = entry.last_access.max(d.last_access);
+            entry.cached_at = entry.cached_at.max(d.cached_at);
+        } else {
+            entry.size = d.size;
+            entry.file_count = 1;
+            entry.last_access = d.last_access;
+            entry.cached_at = d.cached_at;
+            entry.expiry = time_until_expiry_map(d.cached_at, &d.headers, max_age);
+        }
+    }
+
+    (children.into_values().collect(), exact)
+}
+
+/// Sort items: directories always first, then by the chosen key.
+fn sort_items(items: &mut [LsItem], key: SortKey, reverse: bool) {
+    items.sort_by(|a, b| {
+        match (a.is_dir, b.is_dir) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+        let ord = match key {
+            SortKey::Name => a.name.cmp(&b.name),
+            SortKey::Time => a.last_access.cmp(&b.last_access),
+            SortKey::Cached => a.cached_at.cmp(&b.cached_at),
+            SortKey::Size => a.size.cmp(&b.size),
+        };
+        // time/cached/size default to descending (newest/largest first)
+        match key {
+            SortKey::Name => {
+                if reverse {
+                    ord.reverse()
+                } else {
+                    ord
+                }
+            }
+            _ => {
+                if reverse {
+                    ord
+                } else {
+                    ord.reverse()
+                }
+            }
+        }
+    });
+}
+
+/// Print a single `ls` line for one item (long or name form).
+fn print_item(item: &LsItem, long: bool, human: bool) {
+    if long {
+        let size = if human {
+            human_size(item.size)
+        } else {
+            item.size.to_string()
+        };
+        if item.is_dir {
+            println!(
+                "-                -                -         {:>10}  {}/",
+                size, item.name
+            );
+        } else {
+            let cached = fmt_ts(item.cached_at);
+            let access = fmt_ts(item.last_access);
+            let expiry = match item.expiry {
+                Some(s) if s > 0 => format!("{}s", s),
+                _ => "expired".to_string(),
+            };
+            println!(
+                "{cached}  {access}  {expiry:<8}  {:>10}  {}",
+                size, item.name
+            );
+        }
+    } else {
+        let name = if item.is_dir {
+            format!("{}/", item.name)
+        } else {
+            item.name.clone()
+        };
+        println!("{}", name);
+    }
+}
+
+/// Print a list of names in `ls` style: one per line when `-1` or not a tty,
+/// otherwise in aligned columns wrapped to the terminal (or 80) width.
+fn print_names(names: &[String], oneline: bool) {
+    if oneline || !std::io::stdout().is_terminal() {
+        for n in names {
+            println!("{}", n);
+        }
+        return;
+    }
+    let width = names.iter().map(|s| s.len()).max().unwrap_or(0) + 2;
+    let width = width.max(1);
+    let term_w = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(80);
+    let cols = std::cmp::max(1, term_w / width);
+    for (i, n) in names.iter().enumerate() {
+        if i > 0 && i % cols == 0 {
+            println!();
+        }
+        print!("{:<width$}", n);
+    }
+    println!();
+}
+
+/// Render one directory level: header (only when recursing), entries, then
+/// descend into subdirectories if `-R` was requested.
+fn render_level(
+    matched: &[(String, CacheEntryDetail)],
+    base: &str,
+    opts: &LsOpts,
+    max_age: u64,
+) {
+    let (mut items, exact) = collect_children(matched, base, max_age);
+
+    if let Some(d) = exact {
+        // `base` is a single cached file — list just it.
+        let item = LsItem {
+            name: d.url.rsplit('/').next().unwrap_or(&d.url).to_string(),
+            is_dir: false,
+            size: d.size,
+            cached_at: d.cached_at,
+            last_access: d.last_access,
+            expiry: time_until_expiry_map(d.cached_at, &d.headers, max_age),
+            file_count: 1,
+        };
+        if opts.long {
+            print_item(&item, true, opts.human);
+        } else {
+            print_item(&item, false, opts.human);
+        }
+        return;
+    }
+
+    if items.is_empty() {
+        if opts.recursive {
+            let display = if base.is_empty() {
+                "cache".to_string()
+            } else {
+                base.to_string()
+            };
+            println!("{}:", display);
+        }
+        return;
+    }
+
+    sort_items(&mut items, opts.sort, opts.reverse);
+
+    if opts.recursive {
+        let display = if base.is_empty() {
+            "cache".to_string()
+        } else {
+            base.to_string()
+        };
+        println!("{}:", display);
+    }
+
+    if opts.long {
+        for it in &items {
+            print_item(it, true, opts.human);
+        }
+    } else {
+        let names: Vec<String> = items
+            .iter()
+            .map(|it| {
+                if it.is_dir {
+                    format!("{}/", it.name)
+                } else {
+                    it.name.clone()
+                }
+            })
+            .collect();
+        print_names(&names, opts.oneline);
+    }
+
+    if opts.recursive {
+        for it in &items {
+            if it.is_dir {
+                let new_base = if base.is_empty() {
+                    it.name.clone()
+                } else {
+                    format!("{}/{}", base, it.name)
+                };
+                render_level(matched, &new_base, opts, max_age);
+            }
+        }
+    }
+}
+
+async fn cmd_ls(
+    dir: &PathBuf,
+    maps: &[UrlMap],
+    target: Option<String>,
+    opts: &LsOpts,
+) -> anyhow::Result<()> {
+    if !dir.join("cache.db").exists() {
+        println!("cache is empty or not initialized at {}", dir.display());
+        return Ok(());
+    }
+    let cache = Cache::new(dir.clone(), u64::MAX)?;
+    let details = cache.list_all_detailed().await?;
+    if details.is_empty() {
+        println!("(no cached entries)");
+        return Ok(());
+    }
+
+    let max_age = Config::max_cache_age_only();
+    let target_str = target.unwrap_or_default();
+    let normalized = normalize_target(&target_str);
+    let has_glob = normalized.contains('*') || normalized.contains('?');
+
+    // Resolve each entry to its display root and whether it matches the selector.
+    let mut matched: Vec<(String, CacheEntryDetail)> = Vec::new();
+    let base;
+
+    if target_str.is_empty() {
+        base = String::new();
+        for d in details {
+            let r = Resolved::new(&d.url, maps);
+            let root = format!("{}{}", r.disp_host, r.disp_path);
+            matched.push((root, d));
+        }
+    } else if !has_glob {
+        let t = parse_target(&normalized);
+        let p = perspective_for(&t.host, maps);
+        base = format!("{}{}", t.host, t.path_prefix.clone().unwrap_or_default());
+        for d in details {
+            let r = Resolved::new(&d.url, maps);
+            if !r.host_matches(&t.host) {
+                continue;
+            }
+            let root = format!("{}{}", r.host(p), r.path(p));
+            let in_scope = match &t.path_prefix {
+                None => true,
+                Some(pre) => {
+                    root == format!("{}{}", t.host, pre)
+                        || root.starts_with(&format!("{}{}/", t.host, pre))
+                }
+            };
+            if in_scope {
+                matched.push((root, d));
+            }
+        }
+    } else {
+        // glob selector
+        let gb = glob_base(&normalized);
+        base = gb.clone();
+        let host_scope = if gb.contains('/') {
+            Some(gb[..gb.find('/').unwrap()].to_string())
+        } else if !gb.is_empty() {
+            Some(gb.clone())
+        } else {
+            None
+        };
+        let p = host_scope
+            .as_ref()
+            .map(|h| perspective_for(h, maps))
+            .unwrap_or(Perspective::Real);
+        let re = glob_to_regex(&normalized[gb.len()..])?;
+        let pattern = &normalized[gb.len()..];
+        for d in details {
+            let r = Resolved::new(&d.url, maps);
+            let root = match &host_scope {
+                Some(h) => {
+                    if !r.host_matches(h) {
+                        continue;
+                    }
+                    format!("{}{}", r.host(p), r.path(p))
+                }
+                None => format!("{}{}", r.disp_host, r.disp_path),
+            };
+            if !root.starts_with(gb.as_str()) {
+                continue;
+            }
+            let rel = root.strip_prefix(gb.as_str()).unwrap_or(&root);
+            let rel = rel.trim_start_matches('/');
+            let glob_ok = if pattern.contains('/') {
+                re.is_match(rel)
+            } else {
+                match &host_scope {
+                    Some(_) => {
+                        let immediate = rel.split('/').next().unwrap_or("");
+                        !immediate.is_empty() && re.is_match(immediate)
+                    }
+                    None => {
+                        let comps: Vec<&str> =
+                            root.split('/').filter(|s| !s.is_empty()).collect();
+                        comps.len() == 2 && re.is_match(comps[1])
+                    }
+                }
+            };
+            if glob_ok {
+                matched.push((root, d));
+            }
+        }
+    }
+
+    if matched.is_empty() {
+        if target_str.is_empty() {
+            println!("(no cached entries)");
+        } else if has_glob {
+            println!("no entries match '{}'", target_str);
+        } else {
+            println!("no entries for '{}'", target_str);
+        }
+        return Ok(());
+    }
+
+    render_level(&matched, &base, opts, max_age);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -668,6 +1133,22 @@ mod tests {
             normalize_target("http://deb.debian.org/pool/x"),
             "deb.debian.org/pool/x"
         );
+    }
+
+    #[test]
+    fn test_glob_base() {
+        assert_eq!(glob_base("deb.debian.org/*.deb"), "deb.debian.org/");
+        assert_eq!(glob_base("deb.debian.org/pool/*/a.deb"), "deb.debian.org/pool/");
+        assert_eq!(glob_base("*.deb"), "");
+        assert_eq!(glob_base("deb.debian.org/pool/main"), "");
+        assert_eq!(glob_base("a/b?c"), "a/");
+        assert_eq!(glob_base("host/prefix/x*.deb"), "host/prefix/");
+    }
+
+    #[test]
+    fn test_glob_base_no_trailing_slash_for_root_host() {
+        // host-only glob: base is the host + trailing slash
+        assert_eq!(glob_base("deb.debian.org/*.deb"), "deb.debian.org/");
     }
 
     #[test]
