@@ -166,7 +166,7 @@ in the matching perspective (alias vs real).
 |---------|-------------|
 | `cache hosts` | List cached resource hosts with totals (alias, real host, size, file count). |
 | `cache tree <HOST> [<PATH>]` | Show the per-host resource filesystem tree. Files are hidden by default; add `--files`/`-f` to list them. |
-| `cache find <HOST> <QUERY>` | Search files/folders within a host by name. `*` and `?` are wildcards; a `/` in the query matches against the full path. |
+| `cache find <HOST> <QUERY>` | Search files/folders within a host by name. `*` and `?` are wildcards; a `/` in the query matches against the full path. Optional filters: `--min-size`/`--max-size` (bytes or `k/m/g/t`, e.g. `1k`, `2M`), `--cached-min-age`/`--cached-max-age` (age of the cache entry, e.g. `30m`, `6h`, `2d`, `1w`), and `--access-min-age`/`--access-max-age` (age of the last access). `min_age` keeps entries older than the bound, `max_age` keeps entries within it. |
 | `cache ls [<HOST>] [<PATH>]` | List cached entries like the system `ls`, optionally limited to `HOST` and a `PATH` prefix or glob. |
 | `cache info <HOST> <PATH>` | Show details of a single cached file (URL, perspective host/path, size, MD5/SHA1/SHA256/SHA512 checksums, timestamps, freshness, content type). Checksums are computed on the fly from the stored file. |
 | `cache cat <HOST> <PATH>` | Print the raw contents of a single cached file to stdout (streamed). |
@@ -193,6 +193,7 @@ Examples (add `--cache-dir PATH` to target a non-default cache):
 blitzctl cache hosts
 blitzctl cache tree deb.debian.org --files
 blitzctl cache find deb.debian.org '*.deb'
+blitzctl cache find deb.debian.org '*.deb' --min-size 10M --cached-min-age 30d
 blitzctl cache ls -S security.debian.org pool
 blitzctl cache info deb.debian.org pool/main/a/apt_1.0_all.deb
 blitzctl cache cat deb.debian.org pool/main/a/apt_1.0_all.deb > apt.deb

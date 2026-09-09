@@ -1,7 +1,7 @@
 .\" Man page for blitzctl
 .\" Generated from source; do not edit manually.
 .\"
-.TH BLITZCTL 1 "2026-09-09" "0.13.0" "User Commands"
+.TH BLITZCTL 1 "2026-09-09" "0.14.0" "User Commands"
 .SH NAME
 blitzctl \- control utility for the apt-blitz on-disk cache
 .SH SYNOPSIS
@@ -55,7 +55,34 @@ characters and \fB?\fR matches any single character; the match is
 case-insensitive.  A \fB/\fR in the query matches against the full path,
 otherwise the match is against the name (last component).
 .br
-Usage: \fBblitzctl cache find\fR \fIHOST\fR \fIQUERY\fR
+Size and age filters narrow the result to matching files; folders are only
+shown when they contain at least one file that passes the filters.
+.br
+Usage: \fBblitzctl cache find\fR [\fIOPTIONS\fR] \fIHOST\fR \fIQUERY\fR
+.TP
+.B \-\-min\-size \fI\,SIZE\/\fR
+Minimum file size: plain bytes or a \fBk/m/g/t\fR suffix standing for
+powers of 1024, e.g. \fB1024\fR, \fB1k\fR, \fB2M\fR, \fB1G\fR.
+.TP
+.B \-\-max\-size \fI\,SIZE\/\fR
+Maximum file size, with the same suffix syntax as \fB\-\-min\-size\fR.
+.TP
+.B \-\-cached\-min\-age \fI\,DURATION\/\fR
+Only entries cached at least \fIDURATION\fR ago (based on the time the
+entry was first cached).  Follows \fBfind(1)\fR semantics: \fB1d\fR keeps
+entries older than one day.
+.TP
+.B \-\-cached\-max\-age \fI\,DURATION\/\fR
+Only entries cached within \fIDURATION\fR of now (e.g. \fB30m\fR, \fB6h\fR).
+.TP
+.B \-\-access\-min\-age \fI\,DURATION\/\fR
+Like \fB\-\-cached\-min\-age\fR, but based on the last access time.
+.TP
+.B \-\-access\-max\-age \fI\,DURATION\/\fR
+Like \fB\-\-cached\-max\-age\fR, but based on the last access time.
+.P
+A duration is a number with an optional \fBs/m/h/d/w\fR suffix (seconds,
+minutes, hours, days, weeks); a bare number means seconds.
 .SS ls
 List cached entries like the system \fB\&ls\fR over the cache URL namespace,
 optionally limited to \fIHOST\fR and a \fIPATH\fR prefix or glob.  Both take
@@ -152,6 +179,17 @@ Search for \fI.deb\fR packages on a host:
 .B blitzctl cache find
 \fIdeb.debian.org\fR
 .B "*\.deb"
+.RE
+.TP
+Search for large packages cached over two weeks ago:
+.RS
+.B blitzctl cache find
+\fIdeb.debian.org\fR
+.B "*\.deb"
+.B \-\-min\-size
+\fI10M\fR
+.B \-\-cached\-min\-age
+\fI2w\fR
 .RE
 .TP
 List the largest cached entries under a path:
