@@ -260,3 +260,74 @@ async fn blitzctl_cache_ls() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn blitzctl_cache_find_filters() {
+    let dir = std::env::temp_dir().join("apt-blitz-test-blitzctl-find");
+    let _ = std::fs::remove_dir_all(&dir);
+    populate(&dir).await;
+
+    // Size filters: apt_1.0_all.deb is 2048 bytes, b.deb is 1024 bytes.
+    let out = run(
+        &dir,
+        &["cache", "find", "deb.debian.org", "*.deb", "--min-size", "1500"],
+    );
+    assert!(
+        out.contains("apt_1.0_all.deb"),
+        "find --min-size: {}",
+        out
+    );
+    assert!(
+        !out.contains("b/b.deb"),
+        "find --min-size should drop small files: {}",
+        out
+    );
+
+    let out = run(
+        &dir,
+        &["cache", "find", "deb.debian.org", "*.deb", "--max-size", "1500"],
+    );
+    assert!(out.contains("b/b.deb"), "find --max-size: {}", out);
+    assert!(
+        !out.contains("apt_1.0_all.deb"),
+        "find --max-size should drop large files: {}",
+        out
+    );
+
+    // Age filters: entries were just cached (age ~0).
+    let out = run(
+        &dir,
+        &["cache", "find", "deb.debian.org", "*.deb", "--cached-max-age", "1d"],
+    );
+    assert!(
+        out.contains("apt_1.0_all.deb"),
+        "find --cached-max-age: {}",
+        out
+    );
+
+    let out = run(
+        &dir,
+        &["cache", "find", "deb.debian.org", "*.deb", "--cached-min-age", "1m"],
+    );
+    assert!(
+        out.contains("no matches"),
+        "find --cached-min-age should exclude fresh entries: {}",
+        out
+    );
+
+    // Invalid size/duration values are rejected by the CLI.
+    let out = run_all(&dir, &["cache", "find", "deb.debian.org", "*.deb", "--min-size", "1.5M"]);
+    assert!(
+        out.contains("invalid size"),
+        "find should reject bad size: {}",
+        out
+    );
+    let out = run_all(&dir, &["cache", "find", "deb.debian.org", "*.deb", "--cached-min-age", "2x"]);
+    assert!(
+        out.contains("invalid duration"),
+        "find should reject bad duration: {}",
+        out
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

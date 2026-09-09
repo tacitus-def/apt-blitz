@@ -61,6 +61,24 @@ pub enum CacheCmd {
         /// Search query. Supports `*` and `?` wildcards. With a `/` it matches
         /// against the full path; otherwise against the name (last component).
         query: String,
+        /// Minimum file size in bytes; a k/m/g/t suffix means 1024^k (1k, 2M, 1G).
+        #[arg(long, value_parser = parse_size_arg)]
+        min_size: Option<u64>,
+        /// Maximum file size in bytes; a k/m/g/t suffix means 1024^k (1k, 2M, 1G).
+        #[arg(long, value_parser = parse_size_arg)]
+        max_size: Option<u64>,
+        /// Only files cached at least this long ago, e.g. 30m, 6h, 2d, 1w.
+        #[arg(long, value_parser = parse_duration_arg)]
+        cached_min_age: Option<u64>,
+        /// Only files cached within this duration, e.g. 30m, 6h, 2d, 1w.
+        #[arg(long, value_parser = parse_duration_arg)]
+        cached_max_age: Option<u64>,
+        /// Only files last accessed at least this long ago, e.g. 30m, 6h, 2d, 1w.
+        #[arg(long, value_parser = parse_duration_arg)]
+        access_min_age: Option<u64>,
+        /// Only files last accessed within this duration, e.g. 30m, 6h, 2d, 1w.
+        #[arg(long, value_parser = parse_duration_arg)]
+        access_max_age: Option<u64>,
     },
     /// Remove cached entries (all, or by host/path selector)
     Rm {
@@ -131,7 +149,26 @@ pub async fn run(
             path,
             dest,
         } => cmd_cp(&dir, maps, force, &host, &path, &dest).await,
-        CacheCmd::Find { host, query } => cmd_find(&dir, maps, &host, &query).await,
+        CacheCmd::Find {
+            host,
+            query,
+            min_size,
+            max_size,
+            cached_min_age,
+            cached_max_age,
+            access_min_age,
+            access_max_age,
+        } => {
+            let filter = FindFilter {
+                min_size,
+                max_size,
+                cached_min_age,
+                cached_max_age,
+                access_min_age,
+                access_max_age,
+            };
+            cmd_find(&dir, maps, &host, &query, &filter).await
+        }
         CacheCmd::Rm { target, yes } => cmd_rm(&dir, maps, target, yes).await,
         CacheCmd::Ls {
             host,
@@ -570,6 +607,116 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Size spec: plain bytes or a `k/m/g/t` suffix meaning powers of 1024
+/// (e.g. `1024`, `1k`, `2M`, `1G`).
+fn parse_size(arg: &str) -> Option<u64> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return None;
+    }
+    let (digits, mult) = match arg.chars().last()? {
+        'k' | 'K' => (&arg[..arg.len() - 1], 1024_u64),
+        'm' | 'M' => (&arg[..arg.len() - 1], 1024_u64 * 1024),
+        'g' | 'G' => (&arg[..arg.len() - 1], 1024_u64 * 1024 * 1024),
+        't' | 'T' => (&arg[..arg.len() - 1], 1024_u64 * 1024 * 1024 * 1024),
+        _ => (arg, 1_u64),
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    n.checked_mul(mult)
+}
+
+fn parse_size_arg(arg: &str) -> Result<u64, String> {
+    parse_size(arg).ok_or_else(|| {
+        format!(
+            "invalid size '{arg}' (expected bytes or a k/m/g/t suffix, e.g. 1024, 1k, 2M, 1G)"
+        )
+    })
+}
+
+/// Duration spec: a number with an optional `s/m/h/d/w` suffix (seconds,
+/// minutes, hours, days, weeks). A bare number is seconds.
+fn parse_duration(arg: &str) -> Option<u64> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return None;
+    }
+    let (digits, mult) = match arg.chars().last()? {
+        's' | 'S' => (&arg[..arg.len() - 1], 1_u64),
+        'm' | 'M' => (&arg[..arg.len() - 1], 60_u64),
+        'h' | 'H' => (&arg[..arg.len() - 1], 3600_u64),
+        'd' | 'D' => (&arg[..arg.len() - 1], 86400_u64),
+        'w' | 'W' => (&arg[..arg.len() - 1], 604_800_u64),
+        _ => (arg, 1_u64),
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    n.checked_mul(mult)
+}
+
+fn parse_duration_arg(arg: &str) -> Result<u64, String> {
+    parse_duration(arg).ok_or_else(|| {
+        format!(
+            "invalid duration '{arg}' (expected a number with an s/m/h/d/w suffix, e.g. 30m, 6h, 2d, 1w)"
+        )
+    })
+}
+
+/// Size/age constraints applied to cached files before name/path matching.
+///
+/// Age bounds follow the `find(1)` convention: `min_age` keeps entries that
+/// are *at least* that old, `max_age` keeps entries *within* that duration.
+#[derive(Debug, Default)]
+struct FindFilter {
+    min_size: Option<u64>,
+    max_size: Option<u64>,
+    cached_min_age: Option<u64>,
+    cached_max_age: Option<u64>,
+    access_min_age: Option<u64>,
+    access_max_age: Option<u64>,
+}
+
+impl FindFilter {
+    fn passes(&self, entry: &CachedFile, now: i64) -> bool {
+        if let Some(min) = self.min_size {
+            if entry.size < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_size {
+            if entry.size > max {
+                return false;
+            }
+        }
+        if let Some(age) = self.cached_min_age {
+            if now.saturating_sub(entry.cached_at) < age as i64 {
+                return false;
+            }
+        }
+        if let Some(age) = self.cached_max_age {
+            if now.saturating_sub(entry.cached_at) > age as i64 {
+                return false;
+            }
+        }
+        if let Some(age) = self.access_min_age {
+            if now.saturating_sub(entry.last_access) < age as i64 {
+                return false;
+            }
+        }
+        if let Some(age) = self.access_max_age {
+            if now.saturating_sub(entry.last_access) > age as i64 {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Pure matching core for `find`.
 ///
 /// `entries` are pre-resolved against `url_maps`. `p` selects which host/path
@@ -626,6 +773,7 @@ async fn cmd_find(
     maps: &[UrlMap],
     host: &str,
     query: &str,
+    filter: &FindFilter,
 ) -> anyhow::Result<()> {
     if !dir.join("cache.db").exists() {
         println!("cache is empty or not initialized at {}", dir.display());
@@ -635,8 +783,10 @@ async fn cmd_find(
     let entries = cache.list_all().await?;
 
     let p = perspective_for(host, maps);
+    let now = now_secs();
     let resolved: Vec<Resolved> = entries
         .iter()
+        .filter(|e| filter.passes(e, now))
         .map(|e| Resolved::new(&e.url, maps))
         .collect();
 
@@ -1983,5 +2133,157 @@ mod tests {
         let full = dir.path().join(&d.file_path);
         assert_eq!(pipe_file(&full, &mut out).unwrap(), content.len() as u64);
         assert_eq!(out, content);
+    }
+
+    #[test]
+    fn test_parse_size() {
+        assert_eq!(parse_size("0"), Some(0));
+        assert_eq!(parse_size("1024"), Some(1024));
+        assert_eq!(parse_size("1k"), Some(1024));
+        assert_eq!(parse_size("1K"), Some(1024));
+        assert_eq!(parse_size("3M"), Some(3 * 1024 * 1024));
+        assert_eq!(parse_size("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_size(" 1k "), Some(1024));
+        assert_eq!(parse_size(""), None);
+        assert_eq!(parse_size("k"), None);
+        assert_eq!(parse_size("1.5M"), None);
+        assert_eq!(parse_size("-1"), None);
+        // Overflow is rejected instead of wrapping.
+        assert_eq!(parse_size("99999999999999999999T"), None);
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(parse_duration("0"), Some(0));
+        assert_eq!(parse_duration("300"), Some(300));
+        assert_eq!(parse_duration("5s"), Some(5));
+        assert_eq!(parse_duration("10m"), Some(600));
+        assert_eq!(parse_duration("2h"), Some(7200));
+        assert_eq!(parse_duration("1d"), Some(86400));
+        assert_eq!(parse_duration("2w"), Some(2 * 604_800));
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("m"), None);
+        assert_eq!(parse_duration("2x"), None);
+        assert_eq!(parse_duration("-1h"), None);
+    }
+
+    fn cached_file(url: &str, size: u64, cached_at: i64, last_access: i64) -> CachedFile {
+        CachedFile {
+            url: url.to_string(),
+            file_path: String::new(),
+            size,
+            last_access,
+            cached_at,
+        }
+    }
+
+    #[test]
+    fn test_find_filter_size_bounds() {
+        let now = 1_000_000;
+        let small = cached_file("http://h/a.deb", 100, now - 3600, now - 1800);
+        let big = cached_file("http://h/b.deb", 10_000, now - 3600, now - 1800);
+
+        let f = FindFilter {
+            min_size: Some(1000),
+            max_size: None,
+            ..Default::default()
+        };
+        assert!(!f.passes(&small, now));
+        assert!(f.passes(&big, now));
+
+        let f = FindFilter {
+            min_size: None,
+            max_size: Some(1000),
+            ..Default::default()
+        };
+        assert!(f.passes(&small, now));
+        assert!(!f.passes(&big, now));
+
+        // Inclusive bounds.
+        let f = FindFilter {
+            min_size: Some(100),
+            max_size: Some(100),
+            ..Default::default()
+        };
+        assert!(f.passes(&small, now));
+        assert!(!f.passes(&big, now));
+    }
+
+    #[test]
+    fn test_find_filter_cached_age() {
+        let now = 1_000_000;
+        let old = cached_file("http://h/a.deb", 10, now - 7 * 86_400, now);
+        let fresh = cached_file("http://h/b.deb", 10, now - 60, now);
+
+        // min_age: only entries at least N seconds old.
+        let f = FindFilter {
+            cached_min_age: Some(86_400),
+            ..Default::default()
+        };
+        assert!(f.passes(&old, now));
+        assert!(!f.passes(&fresh, now));
+
+        // max_age: only entries cached within N seconds.
+        let f = FindFilter {
+            cached_max_age: Some(3_600),
+            ..Default::default()
+        };
+        assert!(!f.passes(&old, now));
+        assert!(f.passes(&fresh, now));
+    }
+
+    #[test]
+    fn test_find_filter_access_age_and_future_timestamp() {
+        let now = 1_000_000;
+        let stale = cached_file("http://h/a.deb", 10, now, now - 5 * 86_400);
+        let active = cached_file("http://h/b.deb", 10, now, now - 60);
+
+        let f = FindFilter {
+            access_min_age: Some(86_400),
+            ..Default::default()
+        };
+        assert!(f.passes(&stale, now));
+        assert!(!f.passes(&active, now));
+
+        let f = FindFilter {
+            access_max_age: Some(3_600),
+            ..Default::default()
+        };
+        assert!(!f.passes(&stale, now));
+        assert!(f.passes(&active, now));
+
+        // A cached_at in the future (clock skew) must not panic and behaves
+        // as age 0: excluded by min_age, kept by max_age.
+        let future = cached_file("http://h/c.deb", 10, now + 5_000, now);
+        let f = FindFilter {
+            cached_min_age: Some(1),
+            ..Default::default()
+        };
+        assert!(!f.passes(&future, now));
+        let f = FindFilter {
+            cached_max_age: Some(3_600),
+            ..Default::default()
+        };
+        assert!(f.passes(&future, now));
+    }
+
+    #[test]
+    fn test_find_filter_combined() {
+        let now = 1_000_000;
+        let e = cached_file("http://h/a.deb", 1500, now - 86_400, now - 60);
+        let f = FindFilter {
+            min_size: Some(1000),
+            max_size: Some(2000),
+            cached_min_age: Some(86_400),
+            access_max_age: Some(3_600),
+            ..Default::default()
+        };
+        // All constraints hold together.
+        assert!(f.passes(&e, now));
+        // Break one constraint: size too small.
+        let small = cached_file("http://h/b.deb", 500, now - 86_400, now - 60);
+        assert!(!f.passes(&small, now));
+        // Empty filter passes everything.
+        assert!(FindFilter::default().passes(&e, now));
     }
 }
