@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:       apt-blitz
-Version:    0.13.0
+Version:    0.14.0
 Release:    1%{?dist}
 Summary:    APT proxy with multithreaded downloading via Range requests
 Group:      Networking/Other
@@ -69,6 +69,14 @@ exit 0
 %doc README.md
 
 %changelog
+* Wed Sep 09 2026 Petr Sleptsov <spetr@bk.ru> - 0.14.0-1
+- blitzctl cache find accepts size and age filters: --min-size/--max-size
+  (plain bytes or k/m/g/t suffixes) and --cached-min-age/--cached-max-age /
+  --access-min-age/--access-max-age (relative durations s/m/h/d/w, applied
+  to the cached_at and last_access timestamps). min_age keeps entries older
+  than the bound, max_age keeps entries within it.
+- Update blitzctl documentation (README and man page) for the new filters.
+
 * Wed Sep 09 2026 Petr Sleptsov <spetr@bk.ru> - 0.13.0-1
 - Add blitzctl cache cat (raw streamed contents of a single cached file to
   stdout) and cache cp (copy a single cached file to the local filesystem;

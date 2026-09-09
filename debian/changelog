@@ -1,3 +1,16 @@
+apt-blitz (0.14.0-1) unstable; urgency=medium
+
+  * blitzctl cache find accepts size and age filters. --min-size/--max-size
+    take plain bytes or a k/m/g/t suffix (powers of 1024). Age filters are
+    relative durations (s/m/h/d/w) applied to the two cache timestamps:
+    --cached-min-age/--cached-max-age against cached_at and
+    --access-min-age/--access-max-age against last_access. Following find(1)
+    semantics, min_age keeps entries older than the bound and max_age keeps
+    entries within it. Folders are only shown when they contain a file that
+    passes all filters.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Wed, 09 Sep 2026 12:00:00 +0300
+
 apt-blitz (0.13.0-1) unstable; urgency=medium
 
   * blitzctl: add `cache cat` (print the raw streamed contents of a single
