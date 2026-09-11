@@ -258,6 +258,18 @@ async fn blitzctl_cache_ls() {
         out
     );
 
+    // long format adds an aligned column header; expiry renders as HH:MM:SS
+    let out = run(&dir, &["cache", "ls", "-l", "deb.debian.org", "pool/main/a"]);
+    assert!(out.contains("CACHED AT"), "ls -l header CACHED AT: {}", out);
+    assert!(out.contains("LAST ACCESS"), "ls -l header LAST ACCESS: {}", out);
+    assert!(out.contains("EXPIRES"), "ls -l header EXPIRES: {}", out);
+    assert!(out.contains("SIZE"), "ls -l header SIZE: {}", out);
+    assert!(
+        out.contains("apt_1.0_all.deb"),
+        "ls -l lists the exact file: {}",
+        out
+    );
+
     std::fs::remove_dir_all(&dir).ok();
 }
 

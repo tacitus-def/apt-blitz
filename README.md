@@ -174,12 +174,13 @@ in the matching perspective (alias vs real).
 | `cache rm [<TARGET>] [--yes]` | Remove all cached entries, or only those matching `TARGET` (`host` or `host/path`, prefix or exact file). Full removal asks for confirmation unless `--yes` is given. |
 
 `cache ls` mirrors `ls(1)` flags: `-l` (long format — cached date, last
-access, seconds until expiry, size), `--human` (human-readable sizes),
-`-R` (recursive), `-1` (one entry per line), sorting by `-N` name (default),
-`-t` last access, `-c` cache time, `-S` size, and `-r` to reverse.
-Directories are always listed first. Timestamps follow GNU `ls -l` and are
-shown in the local timezone: `%b %e %H:%M` for entries within the last
-six months, `%b  %e  %Y` otherwise.
+access, time until expiry in `HH:MM:SS`, size, column headers), `--human`
+(human-readable sizes), `-R` (recursive), `-1` (one entry per line), sorting
+by `-N` name (default), `-t` last access, `-c` cache time, `-S` size, and
+`-r` to reverse. Directories are always listed first. Timestamps follow GNU
+`ls -l` and are shown in the local timezone: `%b %e %H:%M` for entries within
+the last six months, `%b  %e  %Y` otherwise. An expired entry shows
+`expired` until revalidation.
 
 `cache ls`, `cache info`, `cache cat`, and `cache cp` take `HOST` and
 `PATH` as separate positional arguments, like the other commands — URLs and

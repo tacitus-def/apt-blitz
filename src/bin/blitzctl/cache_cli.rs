@@ -98,7 +98,7 @@ pub enum CacheCmd {
         /// `pool/*.deb`.
         #[arg(default_value = "")]
         path: String,
-        /// Long format: cached_at, last access, seconds until expiry, size.
+        /// Long format: cached_at, last access, time until expiry (HH:MM:SS), size.
         #[arg(long, short)]
         long: bool,
         /// Human-readable sizes (e.g. 1.0 MiB). `-h` is reserved by clap for
@@ -375,6 +375,16 @@ fn human_size(bytes: u64) -> String {
         unit += 1;
     }
     format!("{:.1} {}", size, UNITS[unit])
+}
+
+/// Format a duration as `HH:MM:SS` (e.g. `10:49:10`). Hours are zero-padded
+/// to two digits and may exceed 24 (e.g. `100:00:00`); minutes and seconds
+/// are zero-padded to two digits.
+fn human_duration(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 /// Seconds in half a Gregorian year (31556952 / 2), GNU `ls`'s threshold for
@@ -1314,6 +1324,15 @@ fn sort_items(items: &mut [LsItem], key: SortKey, reverse: bool) {
     });
 }
 
+/// Time until expiry rendered as `HH:MM:SS` for `cache ls -l`. Expired
+/// entries (no value or already expired) render as `expired`.
+fn expiry_str(expiry: Option<u64>) -> String {
+    match expiry {
+        Some(s) if s > 0 => human_duration(s),
+        _ => "expired".to_string(),
+    }
+}
+
 /// Print a single `ls` line for one item (long or name form).
 fn print_item(item: &LsItem, long: bool, human: bool) {
     if long {
@@ -1330,10 +1349,7 @@ fn print_item(item: &LsItem, long: bool, human: bool) {
         } else {
             let cached = fmt_ts(item.cached_at);
             let access = fmt_ts(item.last_access);
-            let expiry = match item.expiry {
-                Some(s) if s > 0 => format!("{}s", s),
-                _ => "expired".to_string(),
-            };
+            let expiry = expiry_str(item.expiry);
             println!(
                 "{cached}  {access}  {expiry:<8}  {:>10}  {}",
                 size, item.name
@@ -1584,6 +1600,12 @@ async fn cmd_ls(
         return Ok(());
     }
 
+    if opts.long {
+        println!(
+            "{:<12}  {:<12}  {:<8}  {:>10}  {}",
+            "CACHED AT", "LAST ACCESS", "EXPIRES", "SIZE", "NAME"
+        );
+    }
     render_level(&matched, &base, opts, max_age);
     Ok(())
 }
@@ -2380,5 +2402,29 @@ mod tests {
         // Non-positive timestamps render as n/a.
         assert_eq!(fmt_ts(0), "n/a");
         assert_eq!(fmt_ts(-5), "n/a");
+    }
+
+    #[test]
+    fn test_human_duration() {
+        assert_eq!(human_duration(0), "00:00:00");
+        assert_eq!(human_duration(1), "00:00:01");
+        assert_eq!(human_duration(59), "00:00:59");
+        assert_eq!(human_duration(60), "00:01:00");
+        assert_eq!(human_duration(3_599), "00:59:59");
+        assert_eq!(human_duration(3_600), "01:00:00");
+        assert_eq!(human_duration(38_950), "10:49:10");
+        assert_eq!(human_duration(86_399), "23:59:59");
+        assert_eq!(human_duration(86_400), "24:00:00");
+        assert_eq!(human_duration(360_000), "100:00:00");
+    }
+
+    #[test]
+    fn test_expiry_str() {
+        // Expired entries (no value or already expired) render as `expired`,
+        // never as a negative countdown.
+        assert_eq!(expiry_str(None), "expired");
+        assert_eq!(expiry_str(Some(0)), "expired");
+        // Live entries render the remaining time.
+        assert_eq!(expiry_str(Some(38_950)), "10:49:10");
     }
 }
