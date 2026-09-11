@@ -899,10 +899,7 @@ async fn cmd_info(
         let r = Resolved::new(&d.url, maps);
         let fresh = time_until_expiry_map(d.cached_at, &d.headers, max_age);
         let content_type = d.headers.get("content-type").map(String::as_str).unwrap_or("-");
-        let fresh_str = match fresh {
-            Some(s) if s > 0 => format!("{}s remaining", s),
-            _ => "expired / not cacheable".to_string(),
-        };
+        let fresh_str = freshness_str(fresh);
         println!("URL:         {}", d.url);
         println!("Host:        {}", r.host(p));
         println!("Path:        {}", r.path(p));
@@ -1330,6 +1327,15 @@ fn expiry_str(expiry: Option<u64>) -> String {
     match expiry {
         Some(s) if s > 0 => human_duration(s),
         _ => "expired".to_string(),
+    }
+}
+
+/// Freshness rendered for `cache info`: live entries count down as
+/// `HH:MM:SS`, expired or non-cacheable entries report so.
+fn freshness_str(fresh: Option<u64>) -> String {
+    match fresh {
+        Some(s) if s > 0 => human_duration(s),
+        _ => "expired / not cacheable".to_string(),
     }
 }
 
@@ -2426,5 +2432,14 @@ mod tests {
         assert_eq!(expiry_str(Some(0)), "expired");
         // Live entries render the remaining time.
         assert_eq!(expiry_str(Some(38_950)), "10:49:10");
+    }
+
+    #[test]
+    fn test_freshness_str() {
+        // Live entries count down as HH:MM:SS.
+        assert_eq!(freshness_str(Some(38_950)), "10:49:10");
+        // Expired or non-cacheable entries report so.
+        assert_eq!(freshness_str(None), "expired / not cacheable");
+        assert_eq!(freshness_str(Some(0)), "expired / not cacheable");
     }
 }

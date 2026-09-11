@@ -1,3 +1,10 @@
+apt-blitz (0.14.3-1) unstable; urgency=medium
+
+  * blitzctl cache info shows the freshness as a countdown (HH:MM:SS) in
+    line with cache ls -l, instead of a raw second count.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Fri, 11 Sep 2026 12:00:00 +0300
+
 apt-blitz (0.14.2-1) unstable; urgency=medium
 
   * blitzctl cache ls -l prints an aligned column header (CACHED AT, LAST
