@@ -1,3 +1,11 @@
+apt-blitz (0.14.1-1) unstable; urgency=medium
+
+  * blitzctl timestamps (cache ls -l and cache info) are now rendered in
+    the local timezone like GNU `ls -l`: `%b %e %H:%M` for timestamps
+    within the last six months, `%b  %e  %Y` otherwise.
+
+ -- Petr Sleptsov <spetr@bk.ru>  Fri, 11 Sep 2026 12:00:00 +0300
+
 apt-blitz (0.14.0-1) unstable; urgency=medium
 
   * blitzctl cache find accepts size and age filters. --min-size/--max-size

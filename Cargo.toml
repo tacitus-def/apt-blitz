@@ -1,6 +1,6 @@
 [package]
 name = "apt-blitz"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2021"
 
 [dependencies]
@@ -33,6 +33,7 @@ tokio-socks = "0.5"
 base64 = "0.22"
 url = "2"
 regex = "1"
+chrono = "0.4"
 
 [dev-dependencies]
 wiremock = "0.6"

@@ -5,12 +5,13 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use apt_blitz::cache::{time_until_expiry_map, Cache, CacheEntryDetail, CachedFile};
+use apt_blitz::config::{Config, UrlMap};
 use anyhow::Context;
+use chrono::TimeZone;
+use clap::Subcommand;
 use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
-use apt_blitz::config::{Config, UrlMap};
-use clap::Subcommand;
 
 #[derive(Subcommand, Debug)]
 pub enum CacheCmd {
@@ -376,13 +377,50 @@ fn human_size(bytes: u64) -> String {
     format!("{:.1} {}", size, UNITS[unit])
 }
 
-/// Format a unix timestamp as an HTTP date, or `n/a` for non-positive values.
+/// Seconds in half a Gregorian year (31556952 / 2), GNU `ls`'s threshold for
+/// a timestamp being shown with a time-of-day instead of the year.
+const SIX_MONTHS_SECS: i64 = 31_556_952 / 2;
+
+/// Whether a timestamp is rendered with a time-of-day, as GNU `ls -l` does
+/// for timestamps within the past six months (future timestamps excluded).
+fn is_ls_recent(secs: i64, now: i64) -> bool {
+    now - SIX_MONTHS_SECS < secs && secs < now
+}
+
+/// The `strftime` format GNU `ls -l` uses, keyed by recentness.
+fn ls_ts_format(recent: bool) -> &'static str {
+    if recent {
+        "%b %e %H:%M"
+    } else {
+        "%b %e  %Y"
+    }
+}
+
+/// Format a timezone-aware instant the way GNU `ls -l` would: abbreviated
+/// month, space-padded day, then time-of-day or (padded) year. Both layouts
+/// are 12 characters wide so columns stay aligned.
+fn fmt_ls_datetime<Tz>(dt: chrono::DateTime<Tz>, recent: bool) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    dt.format(ls_ts_format(recent)).to_string()
+}
+
+/// Format a unix timestamp like GNU `ls -l` in the local timezone, or `n/a`
+/// for non-positive or unrepresentable values.
 fn fmt_ts(secs: i64) -> String {
     if secs <= 0 {
         return "n/a".to_string();
     }
-    let st = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64);
-    httpdate::fmt_http_date(st)
+    match chrono::Local
+        .timestamp_opt(secs, 0)
+        .single()
+        .map(|dt| fmt_ls_datetime(dt, is_ls_recent(secs, now_secs())))
+    {
+        Some(s) => s,
+        None => "n/a".to_string(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,8 +1324,8 @@ fn print_item(item: &LsItem, long: bool, human: bool) {
         };
         if item.is_dir {
             println!(
-                "-                -                -         {:>10}  {}/",
-                size, item.name
+                "{:<12}  {:<12}  {:<8}  {:>10}  {}/",
+                "-", "-", "-", size, item.name
             );
         } else {
             let cached = fmt_ts(item.cached_at);
@@ -2285,5 +2323,62 @@ mod tests {
         assert!(!f.passes(&small, now));
         // Empty filter passes everything.
         assert!(FindFilter::default().passes(&e, now));
+    }
+
+    #[test]
+    fn test_is_ls_recent() {
+        let now = 10_000_000;
+        // Within the past ~6 months -> recent.
+        assert!(is_ls_recent(now - 1, now));
+        assert!(is_ls_recent(now - 10 * 86_400, now));
+        // Exactly at the six-month boundary -> not recent (strict `<`).
+        assert!(!is_ls_recent(now - SIX_MONTHS_SECS, now));
+        // Older than six months -> not recent.
+        assert!(!is_ls_recent(now - 2 * SIX_MONTHS_SECS, now));
+        // Future timestamps -> not recent (GNU ls shows the year).
+        assert!(!is_ls_recent(now + 1, now));
+        assert!(!is_ls_recent(now + 40 * 86_400, now));
+    }
+
+    #[test]
+    fn test_ls_ts_format() {
+        assert_eq!(ls_ts_format(true), "%b %e %H:%M");
+        assert_eq!(ls_ts_format(false), "%b %e  %Y");
+    }
+
+    #[test]
+    fn test_fmt_ls_datetime() {
+        let utc0 = chrono::FixedOffset::east_opt(0).unwrap();
+        let mid = |epoch| chrono::Utc.timestamp_opt(epoch, 0).unwrap().with_timezone(&utc0);
+        // 2024-09-11 14:30:00 UTC
+        assert_eq!(fmt_ls_datetime(mid(1_726_065_000), true), "Sep 11 14:30");
+        assert_eq!(fmt_ls_datetime(mid(1_726_065_000), false), "Sep 11  2024");
+        // 2024-09-05 14:30:00 UTC: space-padded single-digit day
+        assert_eq!(fmt_ls_datetime(mid(1_725_546_600), true), "Sep  5 14:30");
+        assert_eq!(fmt_ls_datetime(mid(1_725_546_600), false), "Sep  5  2024");
+    }
+
+    #[test]
+    fn test_fmt_ts_shapes() {
+        let now = now_secs();
+        // Recent timestamps show a time-of-day in the local timezone.
+        let recent = fmt_ts(now - 3_600);
+        assert!(
+            recent.contains(':'),
+            "recent ts should contain time: {}",
+            recent
+        );
+        // Old timestamps end with a 4-digit year instead.
+        let old = fmt_ts(now - 730 * 86_400);
+        let suffix = old.rsplit(' ').next().unwrap_or("");
+        assert_eq!(suffix.len(), 4);
+        assert!(
+            suffix.chars().all(|c| c.is_ascii_digit()),
+            "old ts should end with a 4-digit year: {}",
+            old
+        );
+        // Non-positive timestamps render as n/a.
+        assert_eq!(fmt_ts(0), "n/a");
+        assert_eq!(fmt_ts(-5), "n/a");
     }
 }
