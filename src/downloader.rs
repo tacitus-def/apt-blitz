@@ -63,10 +63,7 @@ impl DownloadError {
     /// Errors that indicate the whole download must be aborted immediately
     /// instead of being retried per-segment.
     fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            DownloadError::RangeUnsupported | DownloadError::EtagChanged
-        )
+        matches!(self, DownloadError::RangeUnsupported)
     }
 }
 
@@ -293,6 +290,7 @@ async fn download_worker(
         let start_time = Instant::now();
         let mut last_err: Option<DownloadError> = None;
         let mut succeeded = false;
+        let mut skip_etag = false; // Set true after 412 to retry without If-Match
 
         for attempt in 0..=MAX_SEGMENT_RETRIES {
             if cancel.is_cancelled() {
@@ -304,9 +302,11 @@ async fn download_worker(
                 if let Some(ua) = user_agent {
                     builder = builder.header("user-agent", ua);
                 }
-                if let Some(etag) = etag {
-                    if is_strong_etag(etag) {
-                        builder = builder.header("if-match", etag);
+                if !skip_etag {
+                    if let Some(etag) = etag {
+                        if is_strong_etag(etag) {
+                            builder = builder.header("if-match", etag);
+                        }
                     }
                 }
                 match builder.send().await {
@@ -334,13 +334,28 @@ async fn download_worker(
 
             let status = response.status();
             if status == StatusCode::PRECONDITION_FAILED {
-                warn!(
-                    req_id,
-                    worker = worker_id,
-                    segment = id,
-                    "upstream file changed mid-download (If-Match 412); aborting to avoid mixed-generation data"
-                );
-                return Err(DownloadError::EtagChanged);
+                if attempt < MAX_SEGMENT_RETRIES {
+                    warn!(
+                        req_id,
+                        worker = worker_id,
+                        segment = id,
+                        attempt,
+                        "upstream file changed mid-download (If-Match 412); retrying segment without If-Match"
+                    );
+                    skip_etag = true;
+                    last_err = Some(DownloadError::EtagChanged);
+                    // Small delay before retry to let mirror stabilize
+                    tokio::time::sleep(Duration::from_millis(BASE_RETRY_DELAY_MS * 2u64.pow(attempt))).await;
+                    continue;
+                } else {
+                    warn!(
+                        req_id,
+                        worker = worker_id,
+                        segment = id,
+                        "upstream file changed mid-download (If-Match 412); max retries exceeded, aborting"
+                    );
+                    return Err(DownloadError::EtagChanged);
+                }
             }
             if status != StatusCode::PARTIAL_CONTENT && status != StatusCode::OK {
                 error!(

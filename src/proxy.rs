@@ -844,20 +844,6 @@ async fn handle_proxy_inner(
                 .and_then(|v| v.parse::<u64>().ok());
             let can_multithread = can_multithread(content_length, headers.get("accept-ranges"));
 
-            // If previous attempt failed with If-Match 412 (mirror re-sync),
-            // skip multithreaded and fall back to plain proxy to avoid retry loop
-            let etag_changed_previously = state.coalescer.etag_failed_for(&url);
-            if etag_changed_previously {
-                info!(
-                    req_id,
-                    url = %url,
-                    "previous download failed with If-Match 412; falling back to plain proxy"
-                );
-                state.coalescer.complete(&url); // clear etag_failed state
-                let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
-                return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
-            }
-
             if !can_multithread {
                 info!(
                     req_id,

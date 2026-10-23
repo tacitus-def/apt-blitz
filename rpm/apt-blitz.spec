@@ -1,5 +1,5 @@
 Name:           apt-blitz
-Version:        0.14.6
+Version:        0.14.7
 Release:        1%{?dist}
 Summary:        HTTP forward proxy for APT package managers with multithreaded downloads
 
@@ -78,6 +78,11 @@ exit 0
 %dir %attr(0750,-,-) %{_localstatedir}/cache/apt-blitz
 
 %changelog
+* Fri Oct 23 2026 demiurg <demiurg@example.com> - 0.14.7-1
+- Per-segment retry on If-Match 412: retries segment without If-Match (up to 3x)
+- Client Range header support: serve 206 Partial Content for resume
+- All tests passing (397)
+
 * Fri Oct 23 2026 demiurg <demiurg@example.com> - 0.14.6-1
 - Fix: ensure fallback to plain_proxy on If-Match 412 works (was missing in 0.14.5)
 - Client Range header support: serve 206 Partial Content for resume

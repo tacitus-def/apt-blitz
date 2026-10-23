@@ -1,3 +1,12 @@
+apt-blitz (0.14.7-1) unstable; urgency=medium
+
+  * Per-segment retry on If-Match 412: retries segment without If-Match (up to 3x).
+  * Client Range header support: serve 206 Partial Content for download resume
+    (apt-get Range: bytes=X- requests now work correctly).
+  * All tests passing (397).
+
+ -- Demiurg <demiurg@example.com>  Fri, 23 Oct 2026 14:00:00 +0900
+
 apt-blitz (0.14.6-1) unstable; urgency=medium
 
   * Fix: ensure fallback to plain_proxy on If-Match 412 works (was missing in 0.14.5).
