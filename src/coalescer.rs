@@ -6,12 +6,9 @@ use tokio::sync::oneshot;
 
 use crate::buffer::SegmentsBuffer;
 
-enum Inflight {
-    Pending(Vec<oneshot::Sender<Arc<SegmentsBuffer>>>),
-    Downloading(Arc<SegmentsBuffer>),
-}
-
-pub struct Coalescer {
+/// Inner state of the coalescer, wrapped in Arc for shared ownership.
+#[derive(Debug)]
+struct CoalescerInner {
     inflight: Mutex<HashMap<String, Inflight>>,
     /// Tracks whether the last failure for a URL was caused by an upstream
     /// generation change (`If-Match` 412). Survives the `inflight` entry so
@@ -19,11 +16,59 @@ pub struct Coalescer {
     etag_failed: Mutex<HashMap<String, bool>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct Coalescer {
+    inner: Arc<CoalescerInner>,
+}
+
+#[derive(Debug)]
+enum Inflight {
+    Pending(Vec<oneshot::Sender<Arc<SegmentsBuffer>>>),
+    Downloading(Arc<SegmentsBuffer>),
+}
+
+/// RAII guard for a leader registration. On drop, cleans up the `Pending` entry
+/// from the coalescer if the leader never successfully attached a buffer.
+/// Call `commit()` to transfer ownership to the download task and prevent cleanup.
+#[derive(Debug)]
+pub struct LeaderGuard {
+    url: String,
+    coalescer: Option<Arc<Coalescer>>,
+    committed: bool,
+}
+
+impl LeaderGuard {
+    /// Create a no-op guard that does nothing on drop.
+    fn noop() -> Self {
+        Self {
+            url: String::new(),
+            coalescer: None,
+            committed: true,
+        }
+    }
+
+    /// Consume the guard, marking the leader as successfully started.
+    /// The download task now owns the in-flight entry.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LeaderGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Some(coalescer) = self.coalescer.take() {
+                coalescer.complete(&self.url);
+            }
+        }
+    }
+}
+
 const MAX_INFLIGHT: usize = 1024;
 
 #[derive(Debug)]
 pub enum RegisterResult {
-    Leader,
+    Leader(LeaderGuard),
     Follower(oneshot::Receiver<Arc<SegmentsBuffer>>),
     FollowerBuffer(Arc<SegmentsBuffer>),
 }
@@ -37,16 +82,19 @@ impl Default for Coalescer {
 impl Coalescer {
     pub fn new() -> Self {
         Self {
-            inflight: Mutex::new(HashMap::new()),
-            etag_failed: Mutex::new(HashMap::new()),
+            inner: Arc::new(CoalescerInner {
+                inflight: Mutex::new(HashMap::new()),
+                etag_failed: Mutex::new(HashMap::new()),
+            }),
         }
     }
 
     pub fn register(&self, url: &str) -> RegisterResult {
-        let mut map = self.inflight.lock().unwrap();
+        let mut map = self.inner.inflight.lock().unwrap();
 
         if map.len() >= MAX_INFLIGHT {
-            return RegisterResult::Leader;
+            // Return a no-op guard for overflow case - nothing was inserted so nothing to clean up
+            return RegisterResult::Leader(LeaderGuard::noop());
         }
 
         if let Some(inflight) = map.get_mut(url) {
@@ -62,11 +110,15 @@ impl Coalescer {
             }
         }
         map.insert(url.to_string(), Inflight::Pending(Vec::new()));
-        RegisterResult::Leader
+        RegisterResult::Leader(LeaderGuard {
+            url: url.to_string(),
+            coalescer: Some(self.clone().into()),
+            committed: false,
+        })
     }
 
     pub fn attach_buffer(&self, url: &str, buffer: Arc<SegmentsBuffer>) {
-        let mut map = self.inflight.lock().unwrap();
+        let mut map = self.inner.inflight.lock().unwrap();
         if let Some(Inflight::Pending(senders)) = map.remove(url) {
             for sender in senders {
                 let _ = sender.send(buffer.clone());
@@ -76,16 +128,16 @@ impl Coalescer {
     }
 
     pub fn complete(&self, url: &str) {
-        self.inflight.lock().unwrap().remove(url);
-        self.etag_failed.lock().unwrap().remove(url);
+        self.inner.inflight.lock().unwrap().remove(url);
+        self.inner.etag_failed.lock().unwrap().remove(url);
     }
 
     /// Mark the in-flight download as failed. `etag_changed` records whether the
     /// failure was due to the upstream file changing mid-download so that the
     /// coalescing retry loop can apply a dedicated (larger) budget.
     pub fn fail(&self, url: &str, etag_changed: bool) {
-        self.inflight.lock().unwrap().remove(url);
-        self.etag_failed
+        self.inner.inflight.lock().unwrap().remove(url);
+        self.inner.etag_failed
             .lock()
             .unwrap()
             .insert(url.to_string(), etag_changed);
@@ -94,7 +146,13 @@ impl Coalescer {
     /// True if the most recent `fail` for `url` was caused by an upstream
     /// generation change (`If-Match` 412).
     pub fn etag_failed_for(&self, url: &str) -> bool {
-        *self.etag_failed.lock().unwrap().get(url).unwrap_or(&false)
+        *self.inner.etag_failed.lock().unwrap().get(url).unwrap_or(&false)
+    }
+
+    /// Check if a URL currently has an in-flight entry (for testing).
+    #[cfg(test)]
+    pub fn has_inflight(&self, url: &str) -> bool {
+        self.inner.inflight.lock().unwrap().contains_key(url)
     }
 }
 
@@ -119,17 +177,16 @@ mod tests {
     #[test]
     fn test_register_leader_first_call() {
         let c = Coalescer::new();
-        match c.register("http://example.com/file") {
-            RegisterResult::Leader => {}
-            _ => panic!("expected Leader"),
-        }
+        let _guard = c.register("http://example.com/file");
+        assert!(matches!(_guard, RegisterResult::Leader(_)));
     }
 
     #[test]
     fn test_register_follower_then_leader() {
         let c = Coalescer::new();
         // First call is Leader
-        assert!(matches!(c.register("http://example.com/a"), RegisterResult::Leader));
+        let _guard1 = c.register("http://example.com/a");
+        assert!(matches!(_guard1, RegisterResult::Leader(_)));
         // Second call for same URL should be Follower (pending)
         let r = c.register("http://example.com/a");
         match r {
@@ -141,7 +198,7 @@ mod tests {
     #[test]
     fn test_register_multiple_followers() {
         let c = Coalescer::new();
-        c.register("http://example.com/multi");
+        let _guard = c.register("http://example.com/multi");
         // Register 5 followers
         for _ in 0..5 {
             match c.register("http://example.com/multi") {
@@ -155,7 +212,7 @@ mod tests {
     fn test_attach_buffer_sends_to_followers() {
         let c = Coalescer::new();
         let url = "http://example.com/attach";
-        c.register(url);
+        let _guard = c.register(url);
         // Register a follower
         let mut rx = match c.register(url) {
             RegisterResult::Follower(r) => r,
@@ -172,12 +229,12 @@ mod tests {
     fn test_attach_buffer_without_followers() {
         let c = Coalescer::new();
         let url = "http://example.com/no-followers";
-        c.register(url);
+        let _guard = c.register(url);
         let buffer = make_dummy_buffer();
         // Should not panic — transitions from Pending to Downloading with empty sender list
         c.attach_buffer(url, buffer);
         // State should now be Downloading
-        let map = c.inflight.lock().unwrap();
+        let map = c.inner.inflight.lock().unwrap();
         assert!(matches!(map.get(url).unwrap(), Inflight::Downloading(_)));
     }
 
@@ -185,7 +242,7 @@ mod tests {
     fn test_follower_buffer_when_already_downloading() {
         let c = Coalescer::new();
         let url = "http://example.com/already-dl";
-        c.register(url);
+        let _guard = c.register(url);
         let buffer = make_dummy_buffer();
         c.attach_buffer(url, buffer.clone());
         // Now register again — should get FollowerBuffer
@@ -201,10 +258,10 @@ mod tests {
     fn test_complete_removes_entry() {
         let c = Coalescer::new();
         let url = "http://example.com/complete";
-        c.register(url);
-        assert!(c.inflight.lock().unwrap().contains_key(url));
+        let _guard = c.register(url);
+        assert!(c.inner.inflight.lock().unwrap().contains_key(url));
         c.complete(url);
-        assert!(!c.inflight.lock().unwrap().contains_key(url));
+        assert!(!c.inner.inflight.lock().unwrap().contains_key(url));
     }
 
     #[test]
@@ -220,35 +277,34 @@ mod tests {
         // Fill up to MAX_INFLIGHT unique URLs
         for i in 0..MAX_INFLIGHT {
             let url = format!("http://example.com/unique-{}", i);
-            match c.register(&url) {
-                RegisterResult::Leader => {}
-                other => panic!("expected Leader, got {:?} at {}", other, i),
-            }
+            let _guard = c.register(&url);
+            assert!(matches!(_guard, RegisterResult::Leader(_)));
         }
         // On the next register, we should STILL get Leader
         // because the hashmap is full, so it returns Leader as a fallback
-        match c.register("http://example.com/overflow") {
-            RegisterResult::Leader => {}
-            other => panic!("expected Leader (overflow), got {:?}", other),
-        }
+        let _guard = c.register("http://example.com/overflow");
+        assert!(matches!(_guard, RegisterResult::Leader(_)));
     }
 
     #[test]
     fn test_different_urls_independent() {
         let c = Coalescer::new();
-        assert!(matches!(c.register("http://a.com/1"), RegisterResult::Leader));
-        assert!(matches!(c.register("http://b.com/2"), RegisterResult::Leader));
+        let _g1 = c.register("http://a.com/1");
+        assert!(matches!(_g1, RegisterResult::Leader(_)));
+        let _g2 = c.register("http://b.com/2");
+        assert!(matches!(_g2, RegisterResult::Leader(_)));
         // Register same URL again gets Follower
         assert!(matches!(c.register("http://a.com/1"), RegisterResult::Follower(_)));
         // Different URL still Leader
-        assert!(matches!(c.register("http://c.com/3"), RegisterResult::Leader));
+        let _g3 = c.register("http://c.com/3");
+        assert!(matches!(_g3, RegisterResult::Leader(_)));
     }
 
     #[test]
     fn test_attach_buffer_then_register_follower_buffer() {
         let c = Coalescer::new();
         let url = "http://example.com/abc";
-        c.register(url);
+        let _guard = c.register(url);
         let buffer = make_dummy_buffer();
         c.attach_buffer(url, buffer.clone());
         // FollowerBuffer
@@ -260,14 +316,15 @@ mod tests {
         }
         // Complete and re-register as Leader
         c.complete(url);
-        assert!(matches!(c.register(url), RegisterResult::Leader));
+        let _g2 = c.register(url);
+        assert!(matches!(_g2, RegisterResult::Leader(_)));
     }
 
     #[tokio::test]
     async fn test_follower_oneshot_dropped() {
         let c = Coalescer::new();
         let url = "http://example.com/drop";
-        c.register(url);
+        let _guard = c.register(url);
         let rx = match c.register(url) {
             RegisterResult::Follower(r) => r,
             _ => panic!("expected Follower"),
@@ -283,9 +340,11 @@ mod tests {
     fn test_complete_then_register_again() {
         let c = Coalescer::new();
         let url = "http://example.com/cycle";
-        assert!(matches!(c.register(url), RegisterResult::Leader));
+        let _g1 = c.register(url);
+        assert!(matches!(_g1, RegisterResult::Leader(_)));
         c.complete(url);
-        assert!(matches!(c.register(url), RegisterResult::Leader));
+        let _g2 = c.register(url);
+        assert!(matches!(_g2, RegisterResult::Leader(_)));
         c.complete(url);
         // Multiple completes OK
         c.complete(url);
@@ -307,7 +366,7 @@ mod tests {
         let mut followers = 0u32;
         for h in handles {
             match h.await.unwrap() {
-                RegisterResult::Leader => leaders += 1,
+                RegisterResult::Leader(_) => leaders += 1,
                 RegisterResult::Follower(_) => followers += 1,
                 RegisterResult::FollowerBuffer(_) => followers += 1,
             }
@@ -330,12 +389,14 @@ mod tests {
     fn test_register_attach_complete_register_attach() {
         let c = Coalescer::new();
         let url = "http://example.com/full-cycle";
-        assert!(matches!(c.register(url), RegisterResult::Leader));
+        let _g1 = c.register(url);
+        assert!(matches!(_g1, RegisterResult::Leader(_)));
         let buffer = make_dummy_buffer();
         c.attach_buffer(url, buffer.clone());
         c.complete(url);
         // Second cycle
-        assert!(matches!(c.register(url), RegisterResult::Leader));
+        let _g2 = c.register(url);
+        assert!(matches!(_g2, RegisterResult::Leader(_)));
         let buffer2 = make_dummy_buffer();
         c.attach_buffer(url, buffer2.clone());
         c.complete(url);
@@ -346,10 +407,12 @@ mod tests {
         let c = Arc::new(Coalescer::new());
         let url = "http://example.com/rapid-cycle";
         // First leader registers and completes immediately
-        assert!(matches!(c.register(url), RegisterResult::Leader));
+        let _g1 = c.register(url);
+        assert!(matches!(_g1, RegisterResult::Leader(_)));
         c.complete(url);
         // Second registration should also be Leader (entry was removed)
-        assert!(matches!(c.register(url), RegisterResult::Leader));
+        let _g2 = c.register(url);
+        assert!(matches!(_g2, RegisterResult::Leader(_)));
     }
 
     #[test]
@@ -359,9 +422,9 @@ mod tests {
             c.register(&format!("http://example.com/prefill-{}", i));
         }
         // Overflow returns Leader but does NOT insert into map
-        assert!(matches!(c.register("http://example.com/overflow"), RegisterResult::Leader));
+        assert!(matches!(c.register("http://example.com/overflow"), RegisterResult::Leader(_)));
         // Check that overflow URL was NOT added
-        let map = c.inflight.lock().unwrap();
+        let map = c.inner.inflight.lock().unwrap();
         assert!(!map.contains_key("http://example.com/overflow"));
     }
 
@@ -376,7 +439,7 @@ mod tests {
             }));
         }
         for h in handles {
-            assert!(matches!(h.await.unwrap(), RegisterResult::Leader));
+            assert!(matches!(h.await.unwrap(), RegisterResult::Leader(_)));
         }
     }
 

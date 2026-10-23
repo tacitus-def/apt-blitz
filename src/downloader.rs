@@ -388,7 +388,6 @@ async fn download_worker(
 
             let mut stream = response.bytes_stream();
             let mut file_offset = start;
-            let mut stream_failed = false;
 
             loop {
                 let chunk_result = tokio::time::timeout(
@@ -413,11 +412,10 @@ async fn download_worker(
                             );
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                             last_err = Some(DownloadError::Reqwest(e));
-                            stream_failed = true;
+                            continue;
                         } else {
                             return Err(DownloadError::Reqwest(e));
                         }
-                        break;
                     }
                     Ok(Some(Ok(chunk))) => {
                         if cancel.is_cancelled() {
@@ -467,17 +465,12 @@ async fn download_worker(
                                 "stream read timeout, retrying"
                             );
                             last_err = Some(DownloadError::Io(io_err));
-                            stream_failed = true;
+                            continue;
                         } else {
                             return Err(DownloadError::Io(io_err));
                         }
-                        break;
                     }
                 }
-            }
-
-            if stream_failed {
-                continue;
             }
 
             let received = file_offset - start;
@@ -567,8 +560,11 @@ mod tests {
     #[tokio::test]
     async fn test_download_error_from_reqwest() {
         // Create a reqwest::Error by making a request to an invalid URL
-        let client = reqwest::Client::new();
-        let result = client.get("http://255.255.255.255:1/").send().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let result = client.get("http://this-domain-definitely-does-not-exist-12345.invalid/").send().await;
         let err = result.unwrap_err();
         let de: DownloadError = err.into();
         assert!(matches!(de, DownloadError::Reqwest(_)));

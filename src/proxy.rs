@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn, info_span, Instrument};
 
 use crate::buffer::SegmentsBuffer;
 use crate::cache::{etag_equals, is_fresh, time_until_expiry, Cache};
-use crate::coalescer::{Coalescer, RegisterResult};
+use crate::coalescer::{Coalescer, LeaderGuard, RegisterResult};
 use crate::config::{Config, ProxyType, UrlMap};
 use crate::downloader::{download_multithreaded, DownloadError};
 
@@ -33,7 +33,7 @@ static NEXT_REQ_ID: AtomicU64 = AtomicU64::new(1);
 enum CoalesceOutcome {
     Cached { path: std::path::PathBuf, headers: HeaderMap },
     FollowerBuffer(Arc<SegmentsBuffer>),
-    Leader,
+    Leader(LeaderGuard),
 }
 
 /// Result of a conditional HEAD revalidation against upstream.
@@ -48,6 +48,40 @@ enum Revalidate {
 }
 use crate::ftp;
 use crate::rate_limit::{IpPermit, IpRateLimiter, TokenBucket, WorkerLimiter};
+
+/// Parsed Range header from client.
+#[derive(Debug, Clone, Copy)]
+struct ClientRange {
+    start: u64,
+    end: Option<u64>, // None means to end of file
+}
+
+/// Parse Range header value (e.g., "bytes=100-199" or "bytes=100-").
+/// Returns None for invalid/multi-range headers.
+fn parse_range_header(range_header: &str) -> Option<ClientRange> {
+    let range_header = range_header.trim();
+    if !range_header.starts_with("bytes=") {
+        return None;
+    }
+    let range_spec = &range_header[6..]; // Skip "bytes="
+    let parts: Vec<&str> = range_spec.split(',').collect();
+    if parts.len() != 1 {
+        // Don't support multi-range requests
+        return None;
+    }
+    let range = parts[0].trim();
+    if let Some((start_str, end_str)) = range.split_once('-') {
+        let start = start_str.trim().parse::<u64>().ok()?;
+        let end = if end_str.is_empty() {
+            None // suffix range: bytes=100-
+        } else {
+            Some(end_str.trim().parse::<u64>().ok()?)
+        };
+        Some(ClientRange { start, end })
+    } else {
+        None
+    }
+}
 
 const FAILURE_COOLDOWN_SECS: u64 = 60;
 const MAX_FAILURES_BEFORE_COOLDOWN: u32 = 3;
@@ -317,9 +351,9 @@ async fn resolve_with_coalescing(
                 info!(req_id, "joining completed in-flight download");
                 return Ok(CoalesceOutcome::FollowerBuffer(buffer));
             }
-            RegisterResult::Leader => {
+            RegisterResult::Leader(guard) => {
                 info!(req_id, "becoming download leader");
-                return Ok(CoalesceOutcome::Leader);
+                return Ok(CoalesceOutcome::Leader(guard));
             }
         }
     }
@@ -689,6 +723,7 @@ pub async fn handle_proxy(
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
     let user_agent = req.headers().get("user-agent").cloned();
+    let client_range = req.headers().get("range").and_then(|v| v.to_str().ok()).and_then(parse_range_header);
 
     let uri_str = req.uri().to_string();
     let original_url = uri_str.strip_prefix('/').unwrap_or(&uri_str).to_string();
@@ -710,7 +745,7 @@ pub async fn handle_proxy(
     let req_id = NEXT_REQ_ID.fetch_add(1, Ordering::Relaxed);
     let span = info_span!("request", req_id, url = %url);
 
-    handle_proxy_inner(method, state, peer_ip, url, user_agent, req_id)
+    handle_proxy_inner(method, state, peer_ip, url, user_agent, req_id, client_range)
         .instrument(span)
         .await
 }
@@ -722,6 +757,7 @@ async fn handle_proxy_inner(
     url: String,
     user_agent: Option<http::HeaderValue>,
     req_id: u64,
+    client_range: Option<ClientRange>,
 ) -> Result<Response, ProxyError> {
     let mut ip_permit = Some(state.ip_limiter.acquire(peer_ip).await.ok_or_else(|| {
         ProxyError::TooManyRequests
@@ -758,231 +794,312 @@ async fn handle_proxy_inner(
     }
 
     if url.starts_with("ftp://") || url.starts_with("ftps://") {
-        let resp = handle_ftp_proxy(&url, &state, req_id).await?;
+        let resp = handle_ftp_proxy(&url, &state, req_id, client_range).await?;
         return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
 
     match resolve_with_coalescing(&url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.coalesce_etag_max_retries, state.config.max_cache_age, user_agent.as_ref()).await? {
         CoalesceOutcome::Cached { path, headers } => {
-            let resp = serve_file(&path, &headers).await?;
+            let resp = serve_file_with_range(&path, &headers, client_range).await?;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
         CoalesceOutcome::FollowerBuffer(buffer) => {
-            let resp = serve_from_buffer(buffer).await;
+            let resp = serve_from_buffer(buffer, client_range).await;
             return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
         }
-        CoalesceOutcome::Leader => {}
-    }
+        CoalesceOutcome::Leader(leader_guard) => {
+            // leader_guard will auto-cleanup on drop if we return early due to error
+            let head_resp = {
+                let mut builder = state.client.head(&url);
+                if let Some(ua) = &user_agent {
+                    builder = builder.header("user-agent", ua);
+                }
+                builder.send().await?
+            };
+            let head_status = head_resp.status();
+            if !head_status.is_success() {
+                if head_status == StatusCode::METHOD_NOT_ALLOWED
+                    || head_status == StatusCode::NOT_IMPLEMENTED
+                {
+                    // leader_guard drops here, cleaning up Pending entry
+                    let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
+                    return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
+                }
+                // leader_guard drops here, cleaning up Pending entry
+                let mut fwd = HeaderMap::new();
+                copy_forward_headers(head_resp.headers(), &mut fwd);
+                let mut builder = Response::builder().status(head_status);
+                for (name, val) in &fwd {
+                    builder = builder.header(name, val);
+                }
+                let resp = builder.body(Body::empty()).unwrap();
+                return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
+            }
 
-    let head_resp = {
-        let mut builder = state.client.head(&url);
-        if let Some(ua) = &user_agent {
-            builder = builder.header("user-agent", ua);
+            let headers = head_resp.headers().clone();
+            let etag = headers.get("etag").cloned();
+            let content_length = headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let can_multithread = can_multithread(content_length, headers.get("accept-ranges"));
+
+            // If previous attempt failed with If-Match 412 (mirror re-sync),
+            // skip multithreaded and fall back to plain proxy to avoid retry loop
+            let etag_changed_previously = state.coalescer.etag_failed_for(&url);
+            if etag_changed_previously {
+                info!(
+                    req_id,
+                    url = %url,
+                    "previous download failed with If-Match 412; falling back to plain proxy"
+                );
+                state.coalescer.complete(&url); // clear etag_failed state
+                let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
+                return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
+            }
+
+            if !can_multithread {
+                info!(
+                    req_id,
+                    url = %url,
+                    can_multithread = false,
+                    "falling back to plain proxy"
+                );
+                // leader_guard drops here, cleaning up Pending entry
+                let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
+                return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
+            }
+
+            let total_size = content_length.unwrap();
+            info!(
+                req_id,
+                url = %url,
+                total_size = total_size,
+                "starting multithreaded download"
+            );
+
+            let temp_path = state.temp_dir.join(format!("{}.download", uuid::Uuid::new_v4()));
+            let temp_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)
+                .map_err(|e| ProxyError::Internal(format!("failed to create temp file: {e}")))?;
+            temp_file.set_len(total_size).map_err(|e| {
+                ProxyError::Internal(format!("failed to allocate temp file: {e}"))
+            })?;
+
+            let (buffer, notify_rx) = SegmentsBuffer::new(total_size, temp_file, temp_path);
+
+            let mut resp_headers = HeaderMap::new();
+            copy_forward_headers(&headers, &mut resp_headers);
+
+            let resp_status = StatusCode::OK;
+            buffer.set_meta(resp_status, resp_headers.clone());
+            state
+                .coalescer
+                .attach_buffer(&url, buffer.clone());
+            // Download started successfully — commit the guard so it doesn't clean up on drop
+            leader_guard.commit();
+
+            let dl_client = state.client.clone();
+            let dl_url = url.clone();
+            let dl_buffer = buffer.clone();
+            let dl_connections = state.config.connections;
+            let dl_worker_limiter = state.worker_limiter.clone();
+            let dl_upstream_bucket = state.upstream_bucket.clone();
+            let dl_user_agent = user_agent;
+            let dl_etag = etag;
+            let dl_req_id = req_id;
+            let download_handle = tokio::spawn(async move {
+                download_multithreaded(
+                    &dl_client,
+                    &dl_url,
+                    dl_buffer,
+                    dl_connections,
+                    &dl_worker_limiter,
+                    &dl_upstream_bucket,
+                    dl_user_agent,
+                    dl_etag,
+                    dl_req_id,
+                )
+                .await
+            });
+
+            spawn_cache_persistence(
+                download_handle,
+                buffer.clone(),
+                url.clone(),
+                resp_headers.clone(),
+                state.cache.clone(),
+                state.coalescer.clone(),
+                state.failure_tracker.clone(),
+                req_id,
+                |e| matches!(e, DownloadError::EtagChanged),
+            );
+
+            // Compute range response headers for leader
+            let total_size = buffer.total_size();
+            let (range_start, range_end, status) = match client_range {
+                Some(r) => {
+                    let start = r.start.min(total_size);
+                    let end = r.end.map_or(total_size.saturating_sub(1), |e| e.min(total_size.saturating_sub(1)));
+                    if start > end {
+                        (0, total_size.saturating_sub(1), StatusCode::OK)
+                    } else {
+                        (start, end, StatusCode::PARTIAL_CONTENT)
+                    }
+                }
+                None => (0, total_size.saturating_sub(1), StatusCode::OK),
+            };
+            let content_length = if total_size > 0 { range_end.saturating_sub(range_start) + 1 } else { 0 };
+
+            let stream = make_buffer_stream(buffer, notify_rx, client_range);
+            let mut resp_builder = Response::builder().status(status);
+            for (key, val) in &resp_headers {
+                resp_builder = resp_builder.header(key, val);
+            }
+            resp_builder = resp_builder.header("content-length", content_length.to_string());
+            resp_builder = resp_builder.header("accept-ranges", "bytes");
+            if status == StatusCode::PARTIAL_CONTENT && total_size > 0 {
+                resp_builder = resp_builder.header("content-range", format!("bytes {}-{}/{}", range_start, range_end, total_size));
+            }
+            let resp = resp_builder.body(Body::from_stream(stream)).unwrap();
+
+            Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()))
         }
-        builder.send().await?
-    };
-    let head_status = head_resp.status();
-    if !head_status.is_success() {
-        if head_status == StatusCode::METHOD_NOT_ALLOWED
-            || head_status == StatusCode::NOT_IMPLEMENTED
-        {
-            state.coalescer.complete(&url);
-            let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
-            return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
-        }
-        state.coalescer.complete(&url);
-        let mut fwd = HeaderMap::new();
-        copy_forward_headers(head_resp.headers(), &mut fwd);
-        let mut builder = Response::builder().status(head_status);
-        for (name, val) in &fwd {
-            builder = builder.header(name, val);
-        }
-        let resp = builder.body(Body::empty()).unwrap();
-        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
     }
-
-    let headers = head_resp.headers().clone();
-    let etag = headers.get("etag").cloned();
-    let content_length = headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    let can_multithread = can_multithread(content_length, headers.get("accept-ranges"));
-
-    if !can_multithread {
-        info!(
-            req_id,
-            url = %url,
-            can_multithread = false,
-            "falling back to plain proxy"
-        );
-        state.coalescer.complete(&url);
-        let resp = plain_proxy(&state.client, &url, &state.upstream_bucket, user_agent.as_ref(), req_id).await?;
-        return Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()));
-    }
-
-    let total_size = content_length.unwrap();
-    info!(
-        req_id,
-        url = %url,
-        total_size = total_size,
-        "starting multithreaded download"
-    );
-
-    let temp_path = state.temp_dir.join(format!("{}.download", uuid::Uuid::new_v4()));
-    let temp_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_path)
-        .map_err(|e| ProxyError::Internal(format!("failed to create temp file: {e}")))?;
-    temp_file.set_len(total_size).map_err(|e| {
-        ProxyError::Internal(format!("failed to allocate temp file: {e}"))
-    })?;
-
-    let (buffer, notify_rx) = SegmentsBuffer::new(total_size, temp_file, temp_path);
-
-    let mut resp_headers = HeaderMap::new();
-    copy_forward_headers(&headers, &mut resp_headers);
-
-    let resp_status = StatusCode::OK;
-    buffer.set_meta(resp_status, resp_headers.clone());
-    state
-        .coalescer
-        .attach_buffer(&url, buffer.clone());
-
-    let dl_client = state.client.clone();
-    let dl_url = url.clone();
-    let dl_buffer = buffer.clone();
-    let dl_connections = state.config.connections;
-    let dl_worker_limiter = state.worker_limiter.clone();
-    let dl_upstream_bucket = state.upstream_bucket.clone();
-    let dl_user_agent = user_agent;
-    let dl_etag = etag;
-    let dl_req_id = req_id;
-    let download_handle = tokio::spawn(async move {
-        download_multithreaded(
-            &dl_client,
-            &dl_url,
-            dl_buffer,
-            dl_connections,
-            &dl_worker_limiter,
-            &dl_upstream_bucket,
-            dl_user_agent,
-            dl_etag,
-            dl_req_id,
-        )
-        .await
-    });
-
-    spawn_cache_persistence(
-        download_handle,
-        buffer.clone(),
-        url.clone(),
-        resp_headers.clone(),
-        state.cache.clone(),
-        state.coalescer.clone(),
-        state.failure_tracker.clone(),
-        req_id,
-        |e| matches!(e, DownloadError::EtagChanged),
-    );
-
-    let stream = make_buffer_stream(buffer, notify_rx);
-    let mut resp_builder = Response::builder().status(resp_status);
-    for (key, val) in &resp_headers {
-        resp_builder = resp_builder.header(key, val);
-    }
-    let resp = resp_builder.body(Body::from_stream(stream)).unwrap();
-
-    Ok(wrap_response_with_permit(resp, ip_permit.take().unwrap(), state.cancel.clone()))
 }
 
-async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64) -> Result<Response, ProxyError> {
+async fn handle_ftp_proxy(url: &str, state: &AppState, req_id: u64, client_range: Option<ClientRange>) -> Result<Response, ProxyError> {
     info!(req_id, "ftp request");
 
     match resolve_with_coalescing(url, &state.client, &state.cache, &state.coalescer, &state.failure_tracker, req_id, Duration::from_secs(state.config.coalesce_follower_timeout_secs), state.config.coalesce_max_retries, state.config.coalesce_etag_max_retries, state.config.max_cache_age, None).await? {
         CoalesceOutcome::Cached { path, headers } => {
-            return serve_file(&path, &headers).await;
+            return serve_file_with_range(&path, &headers, client_range).await;
         }
         CoalesceOutcome::FollowerBuffer(buffer) => {
-            return Ok(serve_from_buffer(buffer).await);
+            return Ok(serve_from_buffer(buffer, client_range).await);
         }
-        CoalesceOutcome::Leader => {}
+        CoalesceOutcome::Leader(leader_guard) => {
+            let ftp_url = match ftp::parse_ftp_url(url) {
+                Ok(u) => u,
+                Err(e) => return Err(ProxyError::BadRequest(e.to_string())),
+            };
+
+            let total_size = match ftp::check_ftp_size(&ftp_url).await {
+                Ok(s) => s,
+                Err(e) => return Err(ProxyError::BadGateway(format!("FTP SIZE failed: {e}"))),
+            };
+            info!(req_id, total_size, "FTP file size");
+
+            let temp_path = state.temp_dir.join(format!("{}.download", uuid::Uuid::new_v4()));
+            let temp_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path)
+                .map_err(|e| ProxyError::Internal(format!("failed to create temp file: {e}")))?;
+            temp_file.set_len(total_size).map_err(|e| {
+                ProxyError::Internal(format!("failed to allocate temp file: {e}"))
+            })?;
+
+            let (buffer, notify_rx) = SegmentsBuffer::new(total_size, temp_file, temp_path);
+
+            let mut resp_headers = HeaderMap::new();
+            resp_headers.insert("content-type", "application/octet-stream".parse().unwrap());
+            resp_headers.insert("content-length", total_size.to_string().parse().unwrap());
+            resp_headers.insert("accept-ranges", "bytes".parse().unwrap());
+
+            let resp_status = StatusCode::OK;
+            buffer.set_meta(resp_status, resp_headers.clone());
+            state.coalescer.attach_buffer(url, buffer.clone());
+            // Download started successfully — commit the guard so it doesn't clean up on drop
+            leader_guard.commit();
+
+            let dl_url = ftp_url.clone();
+            let dl_buffer = buffer.clone();
+            let dl_connections = state.config.connections;
+            let dl_worker_limiter = state.worker_limiter.clone();
+            let dl_upstream_bucket = state.upstream_bucket.clone();
+            let dl_req_id = req_id;
+            let download_handle = tokio::spawn(async move {
+                ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections, &dl_worker_limiter, &dl_upstream_bucket, dl_req_id).await
+            });
+
+            spawn_cache_persistence(
+                download_handle,
+                buffer.clone(),
+                url.to_string(),
+                resp_headers.clone(),
+                state.cache.clone(),
+                state.coalescer.clone(),
+                state.failure_tracker.clone(),
+                req_id,
+                |_| false,
+            );
+
+            // Compute range response headers for FTP leader
+            let total_size = buffer.total_size();
+            let (range_start, range_end, status) = match client_range {
+                Some(r) => {
+                    let start = r.start.min(total_size);
+                    let end = r.end.map_or(total_size.saturating_sub(1), |e| e.min(total_size.saturating_sub(1)));
+                    if start > end {
+                        (0, total_size.saturating_sub(1), StatusCode::OK)
+                    } else {
+                        (start, end, StatusCode::PARTIAL_CONTENT)
+                    }
+                }
+                None => (0, total_size.saturating_sub(1), StatusCode::OK),
+            };
+            let content_length = if total_size > 0 { range_end.saturating_sub(range_start) + 1 } else { 0 };
+
+            let stream = make_buffer_stream(buffer, notify_rx, client_range);
+            let mut resp_builder = Response::builder().status(status);
+            for (key, val) in &resp_headers {
+                resp_builder = resp_builder.header(key, val);
+            }
+            resp_builder = resp_builder.header("content-length", content_length.to_string());
+            resp_builder = resp_builder.header("accept-ranges", "bytes");
+            if status == StatusCode::PARTIAL_CONTENT && total_size > 0 {
+                resp_builder = resp_builder.header("content-range", format!("bytes {}-{}/{}", range_start, range_end, total_size));
+            }
+            let resp = resp_builder.body(Body::from_stream(stream)).unwrap();
+            Ok(resp)
+        }
     }
-
-    let ftp_url = match ftp::parse_ftp_url(url) {
-        Ok(u) => u,
-        Err(e) => return Err(ProxyError::BadRequest(e.to_string())),
-    };
-
-    let total_size = match ftp::check_ftp_size(&ftp_url).await {
-        Ok(s) => s,
-        Err(e) => return Err(ProxyError::BadGateway(format!("FTP SIZE failed: {e}"))),
-    };
-    info!(req_id, total_size, "FTP file size");
-
-    let temp_path = state.temp_dir.join(format!("{}.download", uuid::Uuid::new_v4()));
-    let temp_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temp_path)
-        .map_err(|e| ProxyError::Internal(format!("failed to create temp file: {e}")))?;
-    temp_file.set_len(total_size).map_err(|e| {
-        ProxyError::Internal(format!("failed to allocate temp file: {e}"))
-    })?;
-
-    let (buffer, notify_rx) = SegmentsBuffer::new(total_size, temp_file, temp_path);
-
-    let mut resp_headers = HeaderMap::new();
-    resp_headers.insert("content-type", "application/octet-stream".parse().unwrap());
-    resp_headers.insert("content-length", total_size.to_string().parse().unwrap());
-    resp_headers.insert("accept-ranges", "bytes".parse().unwrap());
-
-    let resp_status = StatusCode::OK;
-    buffer.set_meta(resp_status, resp_headers.clone());
-    state.coalescer.attach_buffer(url, buffer.clone());
-
-    let dl_url = ftp_url.clone();
-    let dl_buffer = buffer.clone();
-    let dl_connections = state.config.connections;
-    let dl_worker_limiter = state.worker_limiter.clone();
-    let dl_upstream_bucket = state.upstream_bucket.clone();
-    let dl_req_id = req_id;
-    let download_handle = tokio::spawn(async move {
-        ftp::download_ftp_multithreaded(&dl_url, dl_buffer, dl_connections, &dl_worker_limiter, &dl_upstream_bucket, dl_req_id).await
-    });
-
-    spawn_cache_persistence(
-        download_handle,
-        buffer.clone(),
-        url.to_string(),
-        resp_headers.clone(),
-        state.cache.clone(),
-        state.coalescer.clone(),
-        state.failure_tracker.clone(),
-        req_id,
-        |_| false,
-    );
-
-    let stream = make_buffer_stream(buffer, notify_rx);
-    let mut resp_builder = Response::builder().status(resp_status);
-    for (key, val) in &resp_headers {
-        resp_builder = resp_builder.header(key, val);
-    }
-    let resp = resp_builder.body(Body::from_stream(stream)).unwrap();
-    Ok(resp)
 }
 
-async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>) -> Response {
+async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>, range: Option<ClientRange>) -> Response {
     let meta = buffer.wait_meta().await;
     let rx = buffer.subscribe();
-    let stream = make_buffer_stream(buffer, rx);
+    let stream = make_buffer_stream(buffer, rx, range);
     let mut resp_builder = Response::builder().status(meta.0);
     for (key, val) in &meta.1 {
         resp_builder = resp_builder.header(key, val);
+    }
+    // We need to compute content-length for the range
+    let total_size = meta.1.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let (range_start, range_end, status) = match range {
+        Some(r) => {
+            let start = r.start.min(total_size);
+            let end = r.end.map_or(total_size.saturating_sub(1), |e| e.min(total_size.saturating_sub(1)));
+            if start > end {
+                (0, total_size.saturating_sub(1), StatusCode::OK)
+            } else {
+                (start, end, StatusCode::PARTIAL_CONTENT)
+            }
+        }
+        None => (0, total_size.saturating_sub(1), StatusCode::OK),
+    };
+    let content_length = if total_size > 0 { range_end.saturating_sub(range_start) + 1 } else { 0 };
+    resp_builder = resp_builder.header("content-length", content_length.to_string());
+    resp_builder = resp_builder.header("accept-ranges", "bytes");
+    if status == StatusCode::PARTIAL_CONTENT && total_size > 0 {
+        resp_builder = resp_builder.header("content-range", format!("bytes {}-{}/{}", range_start, range_end, total_size));
     }
     resp_builder.body(Body::from_stream(stream)).unwrap()
 }
@@ -990,6 +1107,7 @@ async fn serve_from_buffer(buffer: Arc<SegmentsBuffer>) -> Response {
 fn make_buffer_stream(
     buffer: Arc<SegmentsBuffer>,
     notify_rx: broadcast::Receiver<usize>,
+    range: Option<ClientRange>,
 ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     struct StreamState {
         buffer: Arc<SegmentsBuffer>,
@@ -997,14 +1115,49 @@ fn make_buffer_stream(
         current_segment: usize,
         offset_in_segment: u64,
         errored: bool,
+        range_start: u64,
+        range_end: u64,
+    }
+
+    // Compute range bounds
+    let total_size = buffer.total_size();
+    let (range_start, range_end) = match range {
+        Some(r) => {
+            let start = r.start.min(total_size);
+            let end = r.end.map_or(total_size.saturating_sub(1), |e| e.min(total_size.saturating_sub(1)));
+            if start > end {
+                (0, total_size.saturating_sub(1))
+            } else {
+                (start, end)
+            }
+        }
+        None => (0, total_size.saturating_sub(1)),
+    };
+
+    // Find starting segment
+    let mut start_segment = 0;
+    let mut start_offset = range_start;
+    if range_start > 0 {
+        let num_segments = buffer.num_segments();
+        for i in 0..num_segments {
+            let seg_end = buffer.segment_end(i);
+            if seg_end > range_start {
+                let seg_start = buffer.segment_start(i);
+                start_segment = i;
+                start_offset = range_start - seg_start;
+                break;
+            }
+        }
     }
 
     let initial = StreamState {
         buffer,
         notify_rx,
-        current_segment: 0,
-        offset_in_segment: 0,
+        current_segment: start_segment,
+        offset_in_segment: start_offset,
         errored: false,
+        range_start,
+        range_end,
     };
 
     futures_util::stream::unfold(initial, |mut state| async move {
@@ -1045,13 +1198,24 @@ fn make_buffer_stream(
             let seg_end = state.buffer.segment_end(state.current_segment);
             let seg_pos = seg_start + state.offset_in_segment;
 
+            // Skip if we're before range start
+            if seg_pos < state.range_start {
+                state.offset_in_segment = state.range_start - seg_start;
+                continue;
+            }
+
+            // Stop if we're past range end
+            if seg_start > state.range_end {
+                return None;
+            }
+
             if seg_pos >= seg_end {
                 state.current_segment += 1;
                 state.offset_in_segment = 0;
                 continue;
             }
 
-            let remaining = seg_end - seg_pos;
+            let remaining = seg_end.saturating_sub(seg_pos).min(state.range_end.saturating_sub(seg_pos) + 1);
 
             let data = state
                 .buffer
@@ -1195,8 +1359,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_error_upstream_response() {
-        let client = reqwest::Client::new();
-        let result = client.get("http://255.255.255.255:1/").send().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        // Use a non-existent domain to guarantee a DNS/connection error
+        let result = client.get("http://this-domain-definitely-does-not-exist-12345.invalid/").send().await;
         let req_err = result.unwrap_err();
         let err = ProxyError::Upstream(req_err);
         let resp = err.into_response();
@@ -1227,8 +1395,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_proxy_error_from_reqwest() {
-        let client = reqwest::Client::new();
-        let result = client.get("http://255.255.255.255:1/").send().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        // Use a non-existent domain to guarantee a DNS/connection error
+        let result = client.get("http://this-domain-definitely-does-not-exist-12345.invalid/").send().await;
         let req_err = result.unwrap_err();
         let err: ProxyError = req_err.into();
         assert!(matches!(err, ProxyError::Upstream(_)));
@@ -1354,9 +1526,10 @@ mod tests {
     #[tokio::test]
     async fn test_serve_file_nonexistent() {
         let headers = HeaderMap::new();
-        let result = serve_file(
+        let result = serve_file_with_range(
             std::path::Path::new("/nonexistent/path/file.deb"),
             &headers,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -1374,7 +1547,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
-        let result = serve_file(&path, &headers).await;
+        let result = serve_file_with_range(&path, &headers, None).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1402,7 +1575,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("etag", "\"xyz\"".parse().unwrap());
         headers.insert("cache-control", "public".parse().unwrap());
-        let result = serve_file(&path, &headers).await;
+        let result = serve_file_with_range(&path, &headers, None).await;
         assert!(result.is_ok());
         let resp = result.unwrap();
         assert_eq!(
@@ -1745,7 +1918,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx);
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, None);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1797,7 +1970,7 @@ mod tests {
         buffer.mark_ready(id2);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx);
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, None);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1835,7 +2008,7 @@ mod tests {
         buffer.mark_ready(id);
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx);
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, None);
         let result: Vec<u8> = futures_util::StreamExt::collect::<Vec<_>>(stream)
             .await
             .into_iter()
@@ -1871,7 +2044,7 @@ mod tests {
         buffer.set_failed();
 
         let stream_rx = buffer.subscribe();
-        let stream = make_buffer_stream(buffer.clone(), stream_rx);
+        let stream = make_buffer_stream(buffer.clone(), stream_rx, None);
         let result: Vec<_> = futures_util::StreamExt::collect::<Vec<_>>(stream).await;
 
         assert_eq!(result.len(), 1);
@@ -2505,7 +2678,7 @@ mod tests {
         let tracker = FailureTracker::new();
         let url = "http://example.com/follower-ok.bin";
 
-        coalescer.register(url);
+        let _guard = coalescer.register(url);
         let buffer = make_test_buffer(1024);
         coalescer.attach_buffer(url, buffer.clone());
 
@@ -2528,7 +2701,7 @@ mod tests {
         let tracker = FailureTracker::new();
         let url = "http://example.com/leader-drop.bin";
 
-        coalescer.register(url);
+        let _guard = coalescer.register(url);
         coalescer.fail(url, false);
 
         let client = reqwest::Client::new();
@@ -2537,7 +2710,7 @@ mod tests {
             Duration::from_millis(100), 3, 3, 86400, None,
         ).await.unwrap();
 
-        assert!(matches!(result, CoalesceOutcome::Leader));
+        assert!(matches!(result, CoalesceOutcome::Leader(_)));
     }
 
     #[tokio::test]
@@ -2547,7 +2720,7 @@ mod tests {
         let tracker = FailureTracker::new();
         let url = "http://example.com/timeout.bin";
 
-        coalescer.register(url);
+        let _guard = coalescer.register(url);
 
         let client = reqwest::Client::new();
         let result = resolve_with_coalescing(
@@ -2608,6 +2781,38 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("cooldown"), "expected cooldown error, got: {err_msg}");
+    }
+
+    /// Test that a leader which fails during HEAD request doesn't leave a leaked
+    /// Pending entry that causes subsequent requests to become stuck followers.
+    /// This is a regression test for the bug where HEAD send error would leave
+    /// the Pending entry in the coalescer, causing all subsequent requests for
+    /// the same URL to time out after coalesce_follower_timeout_secs.
+    #[tokio::test]
+    async fn test_leader_guard_cleanup_on_head_error() {
+        let coalescer = Arc::new(Coalescer::new());
+        let cache = Cache::new(std::env::temp_dir().join("apt-blitz-test-leader-guard-cleanup"), 1024 * 1024).unwrap();
+        let tracker = FailureTracker::new();
+        let url = "http://example.com/leader-guard-cleanup.bin";
+
+        // First, register a leader but don't start download - just leave it pending
+        let _guard = coalescer.register(url);
+        // The guard is kept alive here
+
+        // Now drop the guard (simulating leader error before attach_buffer)
+        drop(_guard);
+
+        // Verify the entry was cleaned up
+        assert!(!coalescer.has_inflight(url), "Pending entry should be cleaned up on guard drop");
+
+        // Now a new request should become Leader again, not Follower
+        let client = reqwest::Client::new();
+        let result = resolve_with_coalescing(
+            url, &client, &cache, &coalescer, &tracker, 1,
+            Duration::from_millis(100), 3, 3, 86400, None,
+        ).await.unwrap();
+
+        assert!(matches!(result, CoalesceOutcome::Leader(_)));
     }
 
 }
@@ -2847,35 +3052,76 @@ fn base64_encode(input: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(input)
 }
 
-async fn serve_file(path: &std::path::Path, headers: &HeaderMap) -> Result<Response, ProxyError> {
-    use tokio::io::AsyncReadExt as _;
+async fn serve_file_with_range(
+    path: &std::path::Path,
+    headers: &HeaderMap,
+    range: Option<ClientRange>,
+) -> Result<Response, ProxyError> {
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
-    let file = tokio::fs::File::open(path)
+    let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|e| ProxyError::Internal(format!("failed to open cache file: {e}")))?;
-    let content_length = file
+    let file_size = file
         .metadata()
         .await
         .map_err(|e| ProxyError::Internal(format!("failed to read cache file metadata: {e}")))?
         .len();
 
-    let stream = futures_util::stream::unfold(file, |mut file| async move {
-        let mut buf = vec![0u8; 65536];
+    let (range_start, range_end, status) = match range {
+        Some(r) => {
+            let start = r.start.min(file_size);
+            let end = r.end.map_or(file_size.saturating_sub(1), |e| e.min(file_size.saturating_sub(1)));
+            if start > end || file_size == 0 {
+                // Invalid range or empty file - serve full file (or could return 416)
+                (0, file_size.saturating_sub(1), StatusCode::OK)
+            } else {
+                // Seek to start position
+                if start > 0 {
+                    file.seek(std::io::SeekFrom::Start(start))
+                        .await
+                        .map_err(|e| ProxyError::Internal(format!("failed to seek cache file: {e}")))?;
+                }
+                (start, end, StatusCode::PARTIAL_CONTENT)
+            }
+        }
+        None => {
+            if file_size == 0 {
+                (0, 0, StatusCode::OK)
+            } else {
+                (0, file_size.saturating_sub(1), StatusCode::OK)
+            }
+        }
+    };
+
+    let content_length = if file_size == 0 { 0 } else { range_end.saturating_sub(range_start) + 1 };
+
+    let stream = futures_util::stream::unfold((file, range_start, range_end), |(mut file, pos, end)| async move {
+        if pos > end {
+            return None;
+        }
+        let mut buf = vec![0u8; 65536.min((end - pos + 1) as usize)];
         match file.read(&mut buf).await {
             Ok(0) => None,
             Ok(n) => {
                 buf.truncate(n);
-                Some((Ok::<_, std::io::Error>(bytes::Bytes::from(buf)), file))
+                Some((Ok::<_, std::io::Error>(bytes::Bytes::from(buf)), (file, pos + n as u64, end)))
             }
-            Err(e) => Some((Err(e), file)),
+            Err(e) => Some((Err(e), (file, pos, end))),
         }
     });
 
-    let mut builder = Response::builder().status(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
     for (key, val) in headers {
         builder = builder.header(key, val);
     }
     builder = builder.header("content-length", content_length.to_string());
     builder = builder.header("accept-ranges", "bytes");
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            "content-range",
+            format!("bytes {}-{}/{}", range_start, range_end, file_size),
+        );
+    }
     Ok(builder.body(Body::from_stream(stream)).unwrap())
 }
