@@ -1,4 +1,25 @@
-apt-blitz (0.14.3-1) unstable; urgency=medium
+apt-blitz (0.14.6-1) unstable; urgency=medium
+
+  * Fix: ensure fallback to plain_proxy on If-Match 412 works (was missing in 0.14.5).
+  * Client Range header support: serve 206 Partial Content for download resume
+    (apt-get Range: bytes=X- requests now work correctly).
+  * If-Match 412 fallback to plain proxy: upstream mirror re-sync no longer
+    retries multithreaded; falls back to single-stream GET without If-Match.
+  * All tests passing (397).
+
+ -- Demiurg <demiurg@example.com>  Fri, 23 Oct 2026 12:00:00 +0900
+
+apt-blitz (0.14.5-1) unstable; urgency=medium
+
+  * Client Range header support: serve 206 Partial Content for download resume
+    (apt-get Range: bytes=X- requests now work correctly).
+  * If-Match 412 retry per-segment: upstream mirror re-sync no longer aborts
+    the entire download; only the affected segment is retried without If-Match.
+  * All tests passing (397).
+
+ -- Demiurg <demiurg@example.com>  Fri, 23 Oct 2026 10:30:00 +0900
+
+apt-blitz (0.14.4-1) unstable; urgency=medium
 
   * blitzctl cache info shows the freshness as a countdown (HH:MM:SS) in
     line with cache ls -l, instead of a raw second count.
